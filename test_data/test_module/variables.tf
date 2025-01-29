@@ -1,5 +1,5 @@
 variable "role_arn" {
-    default = null
+  default = null
 }
 variable "region" {
 }
