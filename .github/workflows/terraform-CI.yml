@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      ROLE_ARN: "arn:aws:iam::303467602807:role/website-pod-tester"
+      ROLE_ARN: "arn:aws:iam::303467602807:role/ecr-tester"
 
     # Use the Bash shell regardless whether the GitHub Actions runner
     # is ubuntu-latest, macos-latest, or windows-latest
