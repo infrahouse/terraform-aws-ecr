@@ -1,4 +1,20 @@
 # terraform-aws-ecr
+For usage see how the module is used in the using tests in `test_data/test_module`.
+
+```hcl
+module "foo_ecr" {
+    source  = "infrahouse/ecr/aws"
+    version = "0.2.1"
+
+    repo_name               = "test_repo"
+    environment             = "development"
+    service_name            = "foo"
+    expire_days_tagged      = 365
+    tag_prefix_list         = ["v"]
+    expire_count_untagged = 5
+}
+```
+
 ## Requirements
 
 | Name | Version |
