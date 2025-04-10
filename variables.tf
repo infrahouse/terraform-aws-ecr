@@ -3,6 +3,12 @@ variable "environment" {
   type        = string
 }
 
+variable "force_delete" {
+  description = "If true, will delete the repository even if it contains images."
+  type        = bool
+  default     = false
+}
+
 variable "repo_name" {
   description = "Name of the repository."
   type        = string
