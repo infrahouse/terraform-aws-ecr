@@ -1,5 +1,5 @@
 locals {
-  module_version = "0.3.0"
+  module_version = "0.4.0"
 
   module_name = "infrahouse/ecr/aws"
   default_module_tags = {
