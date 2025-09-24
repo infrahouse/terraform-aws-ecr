@@ -4,7 +4,7 @@ For usage see how the module is used in the using tests in `test_data/test_modul
 ```hcl
 module "foo_ecr" {
     source  = "infrahouse/ecr/aws"
-    version = "0.4.0"
+    version = "0.5.0"
 
     repo_name               = "test_repo"
     environment             = "development"
