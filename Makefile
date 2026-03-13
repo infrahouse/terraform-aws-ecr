@@ -13,6 +13,8 @@ export PRINT_HELP_PYSCRIPT
 
 TEST_REGION="us-west-2"
 TEST_ROLE="arn:aws:iam::303467602807:role/ecr-tester"
+TEST_PATH ?= tests/test_module.py
+TEST_FILTER ?= "test_ and aws-6"
 
 help: install-hooks
 	@python -c "$$PRINT_HELP_PYSCRIPT" < Makefile
@@ -35,14 +37,18 @@ test-keep:  ## Run a test and keep resources
 		--aws-region=${TEST_REGION} \
 		--test-role-arn=${TEST_ROLE} \
 		--keep-after \
-		tests/test_module.py
+		$(if ${TEST_FILTER},-k "${TEST_FILTER}") \
+		${TEST_PATH} \
+		2>&1 | tee pytest-`date +%Y%m%d-%H%M%S`-output.log
 
 .PHONY: test-clean
 test-clean:  ## Run a test and destroy resources
 	pytest -xvvs \
 		--aws-region=${TEST_REGION} \
 		--test-role-arn=${TEST_ROLE} \
-		tests/test_module.py
+		$(if ${TEST_FILTER},-k "${TEST_FILTER}") \
+		${TEST_PATH} \
+		2>&1 | tee pytest-`date +%Y%m%d-%H%M%S`-output.log
 
 .PHONY: bootstrap
 bootstrap: ## bootstrap the development environment
