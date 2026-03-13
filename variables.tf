@@ -42,6 +42,7 @@ variable "tag_prefix_list" {
   type        = list(string)
   default     = null
 }
+
 variable "rollback_candidate_tag_prefix" {
   description = <<-EOT
     Tag prefix identifying rollback candidate images. Images tagged
@@ -58,9 +59,15 @@ variable "rollback_candidate_retain_count" {
     Maximum number of rollback candidate images to keep. Only images
     tagged with the rollback_candidate_tag_prefix are affected.
     Set to null (default) to disable count-based rollback candidate
-    expiry. At least one of rollback_candidate_retain_count or
-    rollback_candidate_retain_days must be set to enable rollback
-    candidate lifecycle rules.
+    expiry.
+
+    When both rollback_candidate_retain_count and
+    rollback_candidate_retain_days are set, each image is expired by
+    at most one rule — the count-based rule (higher priority) takes
+    precedence. For example, retain_count=5 and retain_days=90 means:
+    keep the 5 most recent, AND expire any beyond that which are also
+    older than 90 days.
+    See: https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html
   EOT
   type        = number
   default     = null
@@ -71,9 +78,13 @@ variable "rollback_candidate_retain_days" {
     Number of days to keep rollback candidate images. Only images
     tagged with the rollback_candidate_tag_prefix are affected.
     Set to null (default) to disable age-based rollback candidate
-    expiry. At least one of rollback_candidate_retain_count or
-    rollback_candidate_retain_days must be set to enable rollback
-    candidate lifecycle rules.
+    expiry.
+
+    This rule has lower priority than rollback_candidate_retain_count.
+    ECR lifecycle rules are evaluated simultaneously but each image
+    is expired by at most one rule, with higher-priority rules taking
+    precedence.
+    See: https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html
   EOT
   type        = number
   default     = null
@@ -86,7 +97,7 @@ variable "expire_days_tagged" {
 }
 
 variable "expire_count_tagged" {
-  description = "Keep no more tagged images that this."
+  description = "Keep no more tagged images than this."
   type        = number
   default     = null
 }
@@ -98,7 +109,7 @@ variable "expire_days_untagged" {
 }
 
 variable "expire_count_untagged" {
-  description = "Keep no more tagged images that this. You can only specify `expire_days_untagged` or `expire_count_untagged`."
+  description = "Keep no more untagged images than this. You can only specify `expire_days_untagged` or `expire_count_untagged`."
   type        = number
   default     = null
 }

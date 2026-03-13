@@ -23,5 +23,7 @@ docs/_build/
 .terraform.lock.hcl
 terraform.tfvars
 /.pytest_cache/
+pytest-*-output.log
+
 /.claude/reviews/
 /.claude/*.local.json

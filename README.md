@@ -1,8 +1,40 @@
 # terraform-aws-ecr
 
+[![Need Help?](https://img.shields.io/badge/Need%20Help%3F-Contact%20Us-0066CC)](https://infrahouse.com/contact)
+[![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://infrahouse.github.io/terraform-aws-ecr/)
+[![Registry](https://img.shields.io/badge/Terraform-Registry-purple?logo=terraform)](https://registry.terraform.io/modules/infrahouse/ecr/aws/latest)
+[![Release](https://img.shields.io/github/release/infrahouse/terraform-aws-ecr.svg)](https://github.com/infrahouse/terraform-aws-ecr/releases/latest)
+[![AWS ECR](https://img.shields.io/badge/AWS-ECR-orange?logo=amazonaws)](https://aws.amazon.com/ecr/)
+[![Security](https://img.shields.io/github/actions/workflow/status/infrahouse/terraform-aws-ecr/vuln-scanner-pr.yml?label=Security)](https://github.com/infrahouse/terraform-aws-ecr/actions/workflows/vuln-scanner-pr.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Creates an AWS ECR repository with configurable lifecycle policies
 for automatic image expiration, including support for rollback
 candidate retention.
+
+## Features
+
+- ECR repository with configurable lifecycle policies
+- Count-based and age-based expiry for tagged and untagged images
+- Rollback candidate retention: protect deployed images from
+  being pruned by lifecycle policies
+- Fully backward compatible — rollback candidate feature is opt-in
+
+## Quick Start
+
+```hcl
+module "foo_ecr" {
+    source  = "registry.infrahouse.com/infrahouse/ecr/aws"
+    version = "0.5.0"
+
+    repo_name             = "test_repo"
+    environment           = "development"
+    service_name          = "foo"
+    expire_days_tagged    = 365
+    tag_prefix_list       = ["v"]
+    expire_count_untagged = 5
+}
+```
 
 ## Lifecycle Policy
 
@@ -95,21 +127,30 @@ months, its last 5 successful deployment images are preserved —
 preventing the kind of outage where an old but still-active image
 gets pruned.
 
-## Basic usage
+### Security note: mutable image tags
 
-```hcl
-module "foo_ecr" {
-    source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-    version = "0.5.0"
+This module does **not** enable ECR immutable tags because the
+rollback candidate feature requires adding tags to existing images
+after deployment (via `PutImage`). This means a principal with
+`ecr:PutImage` permission could retag a malicious image to look
+like a known-good deployment. Mitigate this by restricting
+`ecr:PutImage` to the deployment Lambda role only.
 
-    repo_name             = "test_repo"
-    environment           = "development"
-    service_name          = "foo"
-    expire_days_tagged    = 365
-    tag_prefix_list       = ["v"]
-    expire_count_untagged = 5
-}
-```
+## Documentation
+
+- [GitHub Pages](https://infrahouse.github.io/terraform-aws-ecr/)
+- [Examples](examples/)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[Apache 2.0](LICENSE)
+
+<!-- BEGIN_TF_DOCS -->
+
 ## Requirements
 
 | Name | Version |
@@ -140,15 +181,18 @@ No modules.
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
 | <a name="input_environment"></a> [environment](#input\_environment) | Name of environment. | `string` | n/a | yes |
-| <a name="input_expire_count_tagged"></a> [expire\_count\_tagged](#input\_expire\_count\_tagged) | Keep no more tagged images that this. | `number` | `null` | no |
-| <a name="input_expire_count_untagged"></a> [expire\_count\_untagged](#input\_expire\_count\_untagged) | Keep no more tagged images that this. You can only specify `expire_days_untagged` or `expire_count_untagged`. | `number` | `null` | no |
+| <a name="input_expire_count_tagged"></a> [expire\_count\_tagged](#input\_expire\_count\_tagged) | Keep no more tagged images than this. | `number` | `null` | no |
+| <a name="input_expire_count_untagged"></a> [expire\_count\_untagged](#input\_expire\_count\_untagged) | Keep no more untagged images than this. You can only specify `expire_days_untagged` or `expire_count_untagged`. | `number` | `null` | no |
 | <a name="input_expire_days_tagged"></a> [expire\_days\_tagged](#input\_expire\_days\_tagged) | The amount of days after which a tagged image is deleted from the repository. | `number` | `null` | no |
 | <a name="input_expire_days_untagged"></a> [expire\_days\_untagged](#input\_expire\_days\_untagged) | The amount of days after which an untagged image is deleted from the repository. You can only specify `expire_days_untagged` or `expire_count_untagged`. | `number` | `null` | no |
 | <a name="input_force_delete"></a> [force\_delete](#input\_force\_delete) | If true, will delete the repository even if it contains images. | `bool` | `false` | no |
 | <a name="input_repo_name"></a> [repo\_name](#input\_repo\_name) | Name of the repository. | `string` | n/a | yes |
+| <a name="input_rollback_candidate_retain_count"></a> [rollback\_candidate\_retain\_count](#input\_rollback\_candidate\_retain\_count) | Maximum number of rollback candidate images to keep. Only images<br/>tagged with the rollback\_candidate\_tag\_prefix are affected.<br/>Set to null (default) to disable count-based rollback candidate<br/>expiry.<br/><br/>When both rollback\_candidate\_retain\_count and<br/>rollback\_candidate\_retain\_days are set, each image is expired by<br/>at most one rule — the count-based rule (higher priority) takes<br/>precedence. For example, retain\_count=5 and retain\_days=90 means:<br/>keep the 5 most recent, AND expire any beyond that which are also<br/>older than 90 days.<br/>See: https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html | `number` | `null` | no |
+| <a name="input_rollback_candidate_retain_days"></a> [rollback\_candidate\_retain\_days](#input\_rollback\_candidate\_retain\_days) | Number of days to keep rollback candidate images. Only images<br/>tagged with the rollback\_candidate\_tag\_prefix are affected.<br/>Set to null (default) to disable age-based rollback candidate<br/>expiry.<br/><br/>This rule has lower priority than rollback\_candidate\_retain\_count.<br/>ECR lifecycle rules are evaluated simultaneously but each image<br/>is expired by at most one rule, with higher-priority rules taking<br/>precedence.<br/>See: https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html | `number` | `null` | no |
+| <a name="input_rollback_candidate_tag_prefix"></a> [rollback\_candidate\_tag\_prefix](#input\_rollback\_candidate\_tag\_prefix) | Tag prefix identifying rollback candidate images. Images tagged<br/>with this prefix (e.g., "deployed-at-2026-03-13T17-30-00Z") are<br/>treated as rollback candidates with separate retention rules.<br/>Used by the ECS module to tag images after successful deployment. | `string` | `"deployed-at-"` | no |
 | <a name="input_service_name"></a> [service\_name](#input\_service\_name) | Service name. | `string` | n/a | yes |
-| <a name="input_tag_pattern_list"></a> [tag\_pattern\_list](#input\_tag\_pattern\_list) | If the lifecycle expires tagged images, specify list of tag patterns. | `list(string)` | `null` | no |
-| <a name="input_tag_prefix_list"></a> [tag\_prefix\_list](#input\_tag\_prefix\_list) | If the lifecycle expires tagged images, specify list of tag prefixes. | `list(string)` | `null` | no |
+| <a name="input_tag_pattern_list"></a> [tag\_pattern\_list](#input\_tag\_pattern\_list) | List of tag wildcard patterns for tagged image lifecycle rules.<br/>Only tagged images matching at least one pattern will be expired.<br/>Supports wildcards, e.g. ["v*", "prod-*"] matches "v1.0", "prod-abc".<br/>At least one of tag\_pattern\_list or tag\_prefix\_list is required<br/>when expire\_days\_tagged or expire\_count\_tagged is set. | `list(string)` | `null` | no |
+| <a name="input_tag_prefix_list"></a> [tag\_prefix\_list](#input\_tag\_prefix\_list) | List of tag prefixes for tagged image lifecycle rules.<br/>Only tagged images whose tag starts with one of these prefixes<br/>will be expired, e.g. ["v", "release-"] matches "v1.0", "release-2026".<br/>At least one of tag\_pattern\_list or tag\_prefix\_list is required<br/>when expire\_days\_tagged or expire\_count\_tagged is set. | `list(string)` | `null` | no |
 
 ## Outputs
 
@@ -156,3 +200,4 @@ No modules.
 |------|-------------|
 | <a name="output_repository_arn"></a> [repository\_arn](#output\_repository\_arn) | ECR repository ARN. |
 | <a name="output_repository_url"></a> [repository\_url](#output\_repository\_url) | ECR repository URL. |
+<!-- END_TF_DOCS -->
