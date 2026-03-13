@@ -1,2 +1,4 @@
 infrahouse-core ~= 0.23
 pytest-infrahouse ~= 0.24
+
+checkov ~= 3.2
