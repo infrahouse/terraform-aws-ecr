@@ -25,7 +25,7 @@ candidate retention.
 ```hcl
 module "foo_ecr" {
     source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-    version = "0.6.0"
+    version = "0.6.1"
 
     repo_name             = "test_repo"
     environment           = "development"
@@ -79,7 +79,7 @@ after a successful deployment, the ECS module adds a
 ```hcl
 module "my_service_ecr" {
     source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-    version = "0.6.0"
+    version = "0.6.1"
 
     repo_name    = "my-service-repo"
     environment  = "production"
