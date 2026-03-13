@@ -1,0 +1,12 @@
+framework:
+  - terraform
+skip-path:
+  - test_data
+skip-check:
+  - CKV_TF_1  # Module source version pinning - handled by Renovate
+  - CKV_TF_2  # Module source version pinning - handled by Renovate
+  - CKV_AWS_163  # ECR image scanning on push - use AWS Inspector instead
+  - CKV_AWS_51  # ECR immutable tags - mutable tags required for rollback candidate tagging
+  - CKV_AWS_136  # ECR KMS encryption - AES-256 default is sufficient per coding standard
+compact: true
+quiet: false
