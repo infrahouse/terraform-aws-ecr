@@ -71,6 +71,11 @@ variable "rollback_candidate_retain_count" {
   EOT
   type        = number
   default     = null
+
+  validation {
+    condition     = var.rollback_candidate_retain_count == null ? true : var.rollback_candidate_retain_count >= 2
+    error_message = "rollback_candidate_retain_count must be >= 2 (or null to disable). A value of 1 is dangerous: it keeps only the current deployment, so the previous (possibly still active) image would be pruned."
+  }
 }
 
 variable "rollback_candidate_retain_days" {
