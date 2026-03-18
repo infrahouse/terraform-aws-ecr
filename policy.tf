@@ -89,4 +89,15 @@ data "aws_ecr_lifecycle_policy_document" "repo" {
 resource "aws_ecr_lifecycle_policy" "repo" {
   repository = aws_ecr_repository.repo.name
   policy     = data.aws_ecr_lifecycle_policy_document.repo.json
+
+  lifecycle {
+    precondition {
+      condition = (
+        var.expire_days_tagged == null && var.expire_count_tagged == null
+        ) || (
+        var.tag_prefix_list != null || var.tag_pattern_list != null
+      )
+      error_message = "tag_prefix_list or tag_pattern_list is required when expire_days_tagged or expire_count_tagged is set."
+    }
+  }
 }
