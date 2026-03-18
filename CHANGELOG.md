@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-03-18
+
+### Bug Fixes
+
+- Add retain_days validation and use ternary in precondition
+
+### Features
+
+- Add validation for rollback_candidate_retain_count >= 2
+- Validate tag_prefix_list/tag_pattern_list required for tagged expiry
+
+### Miscellaneous Tasks
+
+- Bump pip/setuptools versions and fix test formatting
+
 ## [0.6.1] - 2026-03-13
 
 ## [0.6.0] - 2026-03-13
