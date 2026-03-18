@@ -94,7 +94,7 @@ resource "aws_ecr_lifecycle_policy" "repo" {
     precondition {
       condition = (
         var.expire_days_tagged == null && var.expire_count_tagged == null
-        ) || (
+        ) ? true : (
         var.tag_prefix_list != null || var.tag_pattern_list != null
       )
       error_message = "tag_prefix_list or tag_pattern_list is required when expire_days_tagged or expire_count_tagged is set."

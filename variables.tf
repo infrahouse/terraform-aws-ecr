@@ -74,7 +74,7 @@ variable "rollback_candidate_retain_count" {
 
   validation {
     condition     = var.rollback_candidate_retain_count == null ? true : var.rollback_candidate_retain_count >= 2
-    error_message = "rollback_candidate_retain_count must be >= 2 (or null to disable). A value of 1 is dangerous: it keeps only the current deployment, so the previous (possibly still active) image would be pruned."
+    error_message = "rollback_candidate_retain_count must be >= 2 (or null to disable). Values below 2 risk pruning the currently active image."
   }
 }
 
@@ -93,6 +93,11 @@ variable "rollback_candidate_retain_days" {
   EOT
   type        = number
   default     = null
+
+  validation {
+    condition     = var.rollback_candidate_retain_days == null ? true : var.rollback_candidate_retain_days >= 1
+    error_message = "rollback_candidate_retain_days must be >= 1 (or null to disable)."
+  }
 }
 
 variable "expire_days_tagged" {
