@@ -39,27 +39,17 @@ def test_module(
 
     # Write terraform.tfvars
     with open(osp.join(terraform_dir, "terraform.tfvars"), "w") as fp:
-        fp.write(
-            dedent(
-                f"""
+        fp.write(dedent(f"""
                 region          = "{aws_region}"
-                """
-            )
-        )
+                """))
         if test_role_arn:
-            fp.write(
-                dedent(
-                    f"""
+            fp.write(dedent(f"""
                     role_arn      = "{test_role_arn}"
-                    """
-                )
-            )
+                    """))
 
     # Update terraform.tf with the specific AWS provider version
     with open(osp.join(terraform_dir, "terraform.tf"), "w") as fp:
-        fp.write(
-            dedent(
-                f"""
+        fp.write(dedent(f"""
                 terraform {{
                   required_providers {{
                     aws = {{
@@ -68,9 +58,7 @@ def test_module(
                     }}
                   }}
                 }}
-                """
-            )
-        )
+                """))
     with terraform_apply(
         terraform_dir,
         destroy_after=not keep_after,
