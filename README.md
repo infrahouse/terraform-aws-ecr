@@ -18,7 +18,10 @@ candidate retention.
 - Count-based and age-based expiry for tagged and untagged images
 - Rollback candidate retention: protect deployed images from
   being pruned by lifecycle policies
-- Fully backward compatible — rollback candidate feature is opt-in
+- Retained tags: protect images that something pins by tag, such as a
+  scheduled task's image, from every other rule
+- Fully backward compatible — rollback candidates and retained tags
+  are opt-in
 
 ## Quick Start
 
@@ -39,8 +42,9 @@ module "foo_ecr" {
 ## Lifecycle Policy
 
 The module supports up to six lifecycle rules, each activated by
-setting the corresponding variable. All are optional and default
-to `null` (disabled).
+setting the corresponding variable, plus one rule per retained tag.
+All are optional and default to `null` (disabled), or `[]` for
+`retain_tags`.
 
 ### Regular image expiry
 
@@ -68,6 +72,49 @@ separate, typically more generous, retention rules to these images.
 | `rollback_candidate_tag_prefix` | Tag prefix for rollback candidates (default: `deployed-at-`) |
 | `rollback_candidate_retain_count` | Keep at most N rollback candidates |
 | `rollback_candidate_retain_days` | Keep rollback candidates for N days |
+
+### Retained tags
+
+`retain_tags` lists image tags whose images are never expired. Use it
+for an image that something runs by tag outside the ECS service's
+deployments, such as the image a scheduled or one-off task's task
+definition pins: the rollback candidate rules don't protect it, since
+it isn't the one deployed, and once it was deployed it carries a
+`deployed-at-*` tag, so they expire it after enough newer deployments.
+
+```hcl
+module "my_service_ecr" {
+    source  = "registry.infrahouse.com/infrahouse/ecr/aws"
+    version = "0.7.0"
+
+    repo_name    = "my-service-repo"
+    environment  = "production"
+    service_name = "my-service"
+
+    rollback_candidate_retain_count = 3
+    expire_count_tagged             = 30
+    tag_pattern_list                = ["*"]
+
+    # The image the migrator task runs, pinned by its git SHA.
+    retain_tags = [var.migrator_image_tag]
+}
+```
+
+Each tag gets a rule of its own, at the highest priorities (1, 2, …),
+that selects the one image carrying the tag and keeps it. ECR never
+lets a lower-priority rule expire an image a higher-priority rule
+selects, so neither the rollback candidate rules nor the tagged-image
+rules can expire it; every other rule keeps its order after them. The
+protection follows the tag: retain another tag, and the old one's
+image falls to the other rules again.
+
+A retained image that is also a rollback candidate still counts toward
+`rollback_candidate_retain_count`, as ECR counts every image a rule's
+filter matches. While it is among the newest rollback candidates, it
+takes one of those places.
+
+Tags are exact: no wildcards. `retain_tags` defaults to `[]`, which
+leaves the policy as it was.
 
 ### How rules interact — example
 
@@ -187,6 +234,7 @@ No modules.
 | <a name="input_expire_days_untagged"></a> [expire\_days\_untagged](#input\_expire\_days\_untagged) | The amount of days after which an untagged image is deleted from the repository. You can only specify `expire_days_untagged` or `expire_count_untagged`. | `number` | `null` | no |
 | <a name="input_force_delete"></a> [force\_delete](#input\_force\_delete) | If true, will delete the repository even if it contains images. | `bool` | `false` | no |
 | <a name="input_repo_name"></a> [repo\_name](#input\_repo\_name) | Name of the repository. | `string` | n/a | yes |
+| <a name="input_retain_tags"></a> [retain\_tags](#input\_retain\_tags) | Image tags whose images the lifecycle policy never expires: for an image<br/>that something runs by tag outside the ECS service's deployments, such as<br/>the image a scheduled or one-off task pins. Each tag gets a rule of its<br/>own, at the highest priorities, that selects the one image carrying it, so<br/>no lower rule can expire that image: not the rollback candidate rules,<br/>even if the image was deployed once and carries a rollback candidate tag,<br/>nor the tagged-image rules. Exact tags, without wildcards.<br/><br/>The protection follows the tag: retain another tag, and the image of the<br/>old one falls to the other rules again. A retained image that is also a<br/>rollback candidate still counts toward rollback\_candidate\_retain\_count,<br/>so it takes one of those places while it is among the newest. | `list(string)` | `[]` | no |
 | <a name="input_rollback_candidate_retain_count"></a> [rollback\_candidate\_retain\_count](#input\_rollback\_candidate\_retain\_count) | Maximum number of rollback candidate images to keep. Only images<br/>tagged with the rollback\_candidate\_tag\_prefix are affected.<br/>Set to null (default) to disable count-based rollback candidate<br/>expiry.<br/><br/>When both rollback\_candidate\_retain\_count and<br/>rollback\_candidate\_retain\_days are set, each image is expired by<br/>at most one rule — the count-based rule (higher priority) takes<br/>precedence. For example, retain\_count=5 and retain\_days=90 means:<br/>keep the 5 most recent, AND expire any beyond that which are also<br/>older than 90 days.<br/>See: https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html | `number` | `null` | no |
 | <a name="input_rollback_candidate_retain_days"></a> [rollback\_candidate\_retain\_days](#input\_rollback\_candidate\_retain\_days) | Number of days to keep rollback candidate images. Only images<br/>tagged with the rollback\_candidate\_tag\_prefix are affected.<br/>Set to null (default) to disable age-based rollback candidate<br/>expiry.<br/><br/>This rule has lower priority than rollback\_candidate\_retain\_count.<br/>ECR lifecycle rules are evaluated simultaneously but each image<br/>is expired by at most one rule, with higher-priority rules taking<br/>precedence.<br/>See: https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html | `number` | `null` | no |
 | <a name="input_rollback_candidate_tag_prefix"></a> [rollback\_candidate\_tag\_prefix](#input\_rollback\_candidate\_tag\_prefix) | Tag prefix identifying rollback candidate images. Images tagged<br/>with this prefix (e.g., "deployed-at-2026-03-13T17-30-00Z") are<br/>treated as rollback candidates with separate retention rules.<br/>Used by the ECS module to tag images after successful deployment. | `string` | `"deployed-at-"` | no |

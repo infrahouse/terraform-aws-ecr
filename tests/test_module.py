@@ -20,6 +20,7 @@ def test_module(
     keep_after,
     aws_region,
     aws_provider_version,
+    boto3_session,
 ):
     terraform_dir = osp.join(TERRAFORM_ROOT_DIR, "test_module")
     state_files = [
@@ -65,3 +66,28 @@ def test_module(
         json_output=True,
     ) as tf_output:
         LOG.info(json.dumps(tf_output, indent=4))
+        ecr = boto3_session.client("ecr", region_name=aws_region)
+        policy = json.loads(
+            ecr.get_lifecycle_policy(repositoryName="test_repo")["lifecyclePolicyText"]
+        )
+        rules = sorted(policy["rules"], key=lambda rule: rule["rulePriority"])
+        LOG.info(json.dumps(rules, indent=4))
+        # The retained tags' rules come first, one per tag, each keeping the one image with the tag; every other rule
+        # follows them, in its usual order.
+        assert [(rule["rulePriority"], rule["selection"]) for rule in rules[:2]] == [
+            (
+                priority,
+                {
+                    "tagStatus": "tagged",
+                    "tagPatternList": [tag],
+                    "countType": "imageCountMoreThan",
+                    "countNumber": 1,
+                },
+            )
+            for priority, tag in ((1, "pinned-1"), (2, "pinned-2"))
+        ]
+        assert [(rule["rulePriority"], rule["description"]) for rule in rules[2:]] == [
+            (3, "Keep not more than 3 rollback candidate images."),
+            (6, "Keep tagged images not older than 365 days."),
+            (7, "Keep not more than 5 untagged images."),
+        ]

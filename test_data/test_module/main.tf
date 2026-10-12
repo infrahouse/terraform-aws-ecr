@@ -8,4 +8,7 @@ module "ecr" {
   tag_prefix_list    = ["v"]
   # expire_days_untagged  = 30
   expire_count_untagged = 5
+
+  rollback_candidate_retain_count = 3
+  retain_tags                     = ["pinned-1", "pinned-2"]
 }
