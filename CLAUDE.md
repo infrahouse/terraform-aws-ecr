@@ -21,11 +21,14 @@ The module has two main concerns split across files:
 
 - **main.tf** creates the `aws_ecr_repository.repo` resource
 - **policy.tf** builds a lifecycle policy using
-  `aws_ecr_lifecycle_policy_document` with four dynamic rule blocks
-  (priorities 1-4) that conditionally activate based on which `expire_*`
-  variables are non-null. The dynamic blocks handle: count-based tagged
-  expiry, age-based tagged expiry, count-based untagged expiry, and
-  age-based untagged expiry
+  `aws_ecr_lifecycle_policy_document`: first one rule per `retain_tags`
+  entry (priorities 1..n), each keeping the one image with that tag,
+  then the rollback candidate rules and the four `expire_*` rules,
+  their priorities shifted by n, each active when its variable is
+  non-null. The dynamic blocks handle: retained tags, count- and
+  age-based rollback candidate expiry, count-based tagged expiry,
+  age-based tagged expiry, count-based untagged expiry, and age-based
+  untagged expiry
 
 Tagged image rules use `tag_prefix_list` and `tag_pattern_list` for
 filtering. Untagged rules (`expire_days_untagged` /

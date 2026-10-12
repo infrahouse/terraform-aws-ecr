@@ -100,6 +100,39 @@ variable "rollback_candidate_retain_days" {
   }
 }
 
+variable "retain_tags" {
+  description = <<-EOT
+    Image tags whose images the lifecycle policy never expires: for an image
+    that something runs by tag outside the ECS service's deployments, such as
+    the image a scheduled or one-off task pins. Each tag gets a rule of its
+    own, at the highest priorities, that selects the one image carrying it, so
+    no lower rule can expire that image: not the rollback candidate rules,
+    even if the image was deployed once and carries a rollback candidate tag,
+    nor the tagged-image rules. Exact tags, without wildcards.
+
+    The protection follows the tag: retain another tag, and the image of the
+    old one falls to the other rules again. A retained image that is also a
+    rollback candidate still counts toward rollback_candidate_retain_count,
+    so it takes one of those places while it is among the newest.
+  EOT
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for tag in var.retain_tags : can(regex("^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$", tag))])
+    error_message = <<-EOT
+      retain_tags holds exact image tags: a letter, digit or underscore, then up to 127 letters, digits, '_', '.' or
+      '-', without wildcards. Got: ${jsonencode(var.retain_tags)}
+    EOT
+  }
+
+  validation {
+    condition     = length(distinct(var.retain_tags)) == length(var.retain_tags)
+    error_message = "retain_tags names each tag once. Got: ${jsonencode(var.retain_tags)}"
+  }
+}
+
 variable "expire_days_tagged" {
   description = "The amount of days after which a tagged image is deleted from the repository."
   type        = number
