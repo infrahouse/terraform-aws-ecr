@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-10-12
+
+### Bug Fixes
+
+- Pre-commit hook permissions
+
+### Features
+
+- Retain_tags, images no other lifecycle rule can expire
+
 ## [0.7.0] - 2026-03-18
 
 ### Bug Fixes
