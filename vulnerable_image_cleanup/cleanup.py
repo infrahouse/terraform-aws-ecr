@@ -35,8 +35,8 @@ ACCEPTED_MEDIA_TYPES = [
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.docker.distribution.manifest.v1+prettyjws",
 ]
-# Botocore drops the fields its model doesn't know. Without these, every image would look unused, or the archived
-# ones would stay hidden.
+# Botocore drops the fields its model doesn't know. Without these, every image would look unused or never pulled, or
+# the archived ones would stay hidden.
 REQUIRED_MODEL_FIELDS = {
     ("inspector2", "EcrContainerImageMetadata"): ("inUseCount", "lastInUseAt"),
     ("ecr", "DescribeImagesFilter"): ("imageStatus",),
