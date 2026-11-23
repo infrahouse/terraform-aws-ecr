@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0] - 2026-11-23
+
+### Bug Fixes
+
+- Require AWS provider 6.0, which the cleanup's S3 bucket needs
+- Pin boto3 ~= 1.41 for the tests, whose stubs need its models
+- Log what ECR deleted when a deletion fails part way
+
+### Documentation
+
+- The vulnerable image cleanup, and the new Terraform floor
+- Say which pulls protect an image, and fix the cleanup example's version
+
+### Features
+
+- Vulnerable image cleanup's Lambda code, with unit tests
+- Opt-in vulnerable image cleanup, off by default and dry when on
+
+### Styling
+
+- Keep the e2e test's base image reference within 120 characters
+
+### Testing
+
+- Integration tests of the vulnerable image cleanup
+- Say any BatchGetImage of an index records a pull, not only the function's
+
 ## [0.8.0] - 2026-10-12
 
 ### Bug Fixes
