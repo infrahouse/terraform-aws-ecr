@@ -1,0 +1,4 @@
+# botocore drops the fields its model doesn't know. 1.41 is the first release whose models have both what the
+# cleanup reads: Inspector's inUseCount and lastInUseAt (botocore 1.38.20 and later), and ECR's imageStatus
+# (1.41.0 and later). cleanup.check_models() fails the run if the packaged botocore lacks them.
+boto3 ~= 1.41
