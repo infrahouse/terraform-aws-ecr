@@ -156,3 +156,158 @@ variable "expire_count_untagged" {
   type        = number
   default     = null
 }
+
+variable "vulnerable_image_cleanup_enabled" {
+  description = <<-EOT
+    Turns on the vulnerable image cleanup: a scheduled Lambda that deletes the images Amazon Inspector
+    reports vulnerable, at or above vulnerable_image_cleanup_min_severity with a fix available, that nothing
+    protects. An image is protected when it carries a tag in retain_tags, is a rollback candidate the
+    lifecycle policy keeps, is in use or was within the soak, was pushed within the least age, or when the
+    job can't tell whether it is in use. An image index is deleted with the manifests it references.
+    Turned on, it runs dry until vulnerable_image_cleanup_dry_run is false. A deletion can't be undone.
+    Off by default: false creates nothing.
+  EOT
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
+variable "vulnerable_image_cleanup_dry_run" {
+  description = <<-EOT
+    The cleanup only logs what it would delete, and its role has no ecr:BatchDeleteImage. Set to false to
+    delete: a deletion can't be undone.
+  EOT
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
+variable "vulnerable_image_cleanup_alarm_emails" {
+  description = <<-EOT
+    Email addresses that get the cleanup Lambda's alarms, through terraform-aws-lambda-monitored. Required
+    when the cleanup is on: a failed run alarms. AWS sends each address a confirmation email to accept.
+  EOT
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = var.vulnerable_image_cleanup_enabled ? length(var.vulnerable_image_cleanup_alarm_emails) > 0 : true
+    error_message = <<-EOT
+      vulnerable_image_cleanup_alarm_emails needs at least one address when vulnerable_image_cleanup_enabled is
+      true: a failed run alarms by email.
+    EOT
+  }
+
+  validation {
+    condition = alltrue([
+      for email in var.vulnerable_image_cleanup_alarm_emails : can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", email))
+    ])
+    error_message = <<-EOT
+      vulnerable_image_cleanup_alarm_emails holds email addresses, e.g. "ops@example.com".
+      Got: ${jsonencode(var.vulnerable_image_cleanup_alarm_emails)}
+    EOT
+  }
+}
+
+variable "vulnerable_image_cleanup_min_severity" {
+  description = <<-EOT
+    The least Inspector severity that makes an image vulnerable: CRITICAL, HIGH, MEDIUM or LOW. Only ACTIVE
+    findings with a fix available count.
+  EOT
+  type        = string
+  default     = "HIGH"
+  nullable    = false
+
+  validation {
+    condition     = contains(["CRITICAL", "HIGH", "MEDIUM", "LOW"], var.vulnerable_image_cleanup_min_severity)
+    error_message = <<-EOT
+      vulnerable_image_cleanup_min_severity must be CRITICAL, HIGH, MEDIUM or LOW, in capitals.
+      Got: ${var.vulnerable_image_cleanup_min_severity}
+    EOT
+  }
+}
+
+variable "vulnerable_image_cleanup_min_age_days" {
+  description = <<-EOT
+    An image pushed within this many days is protected, so an image waiting for its pin isn't deleted.
+  EOT
+  type        = number
+  default     = 7
+  nullable    = false
+
+  validation {
+    condition     = var.vulnerable_image_cleanup_min_age_days >= 1
+    error_message = <<-EOT
+      vulnerable_image_cleanup_min_age_days must be at least 1. Got: ${var.vulnerable_image_cleanup_min_age_days}
+    EOT
+  }
+}
+
+variable "vulnerable_image_cleanup_soak_days" {
+  description = <<-EOT
+    An image in use, or used or pulled within this many days, is protected, so a rollback can go back to it.
+    Inspector's lastInUseAt and ECR's lastRecordedPullTime say when.
+  EOT
+  type        = number
+  default     = 2
+  nullable    = false
+
+  validation {
+    condition     = var.vulnerable_image_cleanup_soak_days >= 1
+    error_message = <<-EOT
+      vulnerable_image_cleanup_soak_days must be at least 1. Got: ${var.vulnerable_image_cleanup_soak_days}
+    EOT
+  }
+}
+
+variable "vulnerable_image_cleanup_protect_rollback_candidates" {
+  description = <<-EOT
+    Protects the rollback candidates the lifecycle policy keeps (rollback_candidate_retain_count and
+    rollback_candidate_retain_days) even when they are vulnerable, so a rollback can go to them until they
+    rotate out. Set to false to delete a vulnerable rollback candidate once nothing else protects it, so a
+    rollback can only go to an image without such findings.
+  EOT
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
+variable "vulnerable_image_cleanup_max_deletions" {
+  description = <<-EOT
+    The most images the cleanup deletes in a run. An image index with the manifests it references counts as
+    one image. The oldest go first; the rest wait for the next run.
+  EOT
+  type        = number
+  default     = 10
+  nullable    = false
+
+  validation {
+    condition = (
+      var.vulnerable_image_cleanup_max_deletions >= 1
+      && floor(var.vulnerable_image_cleanup_max_deletions) == var.vulnerable_image_cleanup_max_deletions
+    )
+    error_message = <<-EOT
+      vulnerable_image_cleanup_max_deletions must be a whole number, at least 1.
+      Got: ${var.vulnerable_image_cleanup_max_deletions}
+    EOT
+  }
+}
+
+variable "vulnerable_image_cleanup_schedule" {
+  description = <<-EOT
+    When the cleanup runs: an EventBridge schedule expression, rate(...) or cron(...).
+    See https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html
+  EOT
+  type        = string
+  default     = "rate(1 day)"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^(rate|cron)\\(.+\\)$", var.vulnerable_image_cleanup_schedule))
+    error_message = <<-EOT
+      vulnerable_image_cleanup_schedule must be an EventBridge rate(...) or cron(...) expression, e.g. "rate(1 day)".
+      Got: ${var.vulnerable_image_cleanup_schedule}
+    EOT
+  }
+}
