@@ -68,9 +68,9 @@ JUDGED_BY_INSPECTOR = "inspector"
 JUDGED_BY_PULL_RECORD = "ecr_pull_record"
 JUDGED_UNKNOWN = "unknown"
 
-# ECR has recorded an image's pulls (lastRecordedPullTime) since AWS's release of 2022-03-02, whose note in botocore
-# 1.24.11's changelog reads "This release adds support for tracking images lastRecordedPullTime". An image pushed
-# before then may have been pulled without a record. The next day, so the day of the release is covered.
+# AWS released ECR's lastRecordedPullTime on 2022-03-02: botocore 1.24.11's changelog notes "This release adds support
+# for tracking images lastRecordedPullTime". An image pushed before then may have been pulled without a record. The
+# next day, so the day of the release is covered.
 PULL_RECORD_START = datetime(2022, 3, 3, tzinfo=timezone.utc)
 
 # How one runnable manifest's use was judged.
@@ -824,7 +824,7 @@ def _judge_use(image: Image, evidence: Evidence, soak_start: datetime) -> str:
         return _UNKNOWN
     if image.last_pulled_at is None:
         # Never pulled, so never run: a runtime pulls an image to run it, and ECR records that pull on the manifest
-        # fetched. Unless it was pushed before ECR recorded pulls.
+        # fetched. Unless it was pushed before AWS released ECR's pull time.
         if image.pushed_at is not None and image.pushed_at >= PULL_RECORD_START:
             return _NEVER_PULLED
         return _UNKNOWN

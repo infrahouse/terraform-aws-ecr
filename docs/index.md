@@ -37,7 +37,9 @@ An image is protected when any of these hold:
 - it is archived;
 - the job can't tell whether it is in use: Inspector gives no in-use data on a platform image or single manifest, and
   ECR recorded a pull of it before the soak, so a long-running task that pulled it then may still run it; or
-  Inspector gives only part of its in-use data; or it was pushed before 2022-03-03, when ECR began recording pulls.
+  Inspector gives only part of its in-use data; or Inspector gives no in-use data on it, ECR has no pull record of it,
+  and it was pushed before 2022-03-03: AWS released ECR's pull time on 2022-03-02, so it may have been pulled without
+  a record.
 
 A protected index protects every manifest it references. When the job can't judge, it deletes nothing: an API error,
 throttling that outlasts the retries, or a page it can't read fails the run, and the Lambda's alarm emails
@@ -51,7 +53,10 @@ image it has never seen in use, and some accounts get them for no image at all.
 Otherwise from ECR's pull record. A container runtime pulls an image to run it, and ECR records the pull on the
 platform image it fetched. So an image none of whose platform images (or, for a single-manifest image, the manifest)
 ECR ever recorded a pull of was never run: the job judges it not in use, and deletes it if nothing else protects it.
-Inspector's scans record no pull, and the job's own reads record one on the indexes only.
+That holds for an image pushed from 2022-03-03; an older one without a pull record is kept, as above.
+
+Inspector's scans record no pull. The job's own reads record one on what they read with BatchGetImage: every index,
+and any manifest whose media type ECR doesn't give. Such a manifest then looks pulled, and is kept.
 
 Only a fetch of a platform image or single manifest counts as a pull. An index's own pull time doesn't count, since
 ECR records the job's read of each index as a pull, and an attestation's doesn't either. A client that already has the

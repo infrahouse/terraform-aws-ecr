@@ -265,8 +265,10 @@ An image is protected, and kept, when any of these hold:
   a single-manifest image, that Inspector gives no in-use data on and
   that ECR recorded a pull of before the soak: a long-running task that
   pulled it then may still run it. Or one that Inspector gives only part
-  of its in-use data on. Or one pushed before 2022-03-03, when ECR began
-  recording pulls, which may have been pulled without a record.
+  of its in-use data on. Or one that Inspector gives no in-use data on,
+  that ECR has no pull record of, and that was pushed before 2022-03-03:
+  AWS released ECR's pull time on 2022-03-02, so such an image may have
+  been pulled without a record.
 
 A reason that holds for any manifest of an index protects the whole
 index, and an index that is kept keeps every manifest it references:
@@ -283,9 +285,14 @@ Otherwise from ECR's pull record. A container runtime pulls an image to
 run it, and ECR records the pull on the platform image it fetched. So an
 image none of whose platform images ECR ever recorded a pull of (or, for
 a single-manifest image, the manifest) was never run: the job judges it
-not in use, and deletes it if nothing else protects it. Inspector's
-scans record no pull, and the job's own reads record one on the indexes
-only.
+not in use, and deletes it if nothing else protects it. That holds for
+an image pushed from 2022-03-03; an older one without a pull record is
+kept, as above.
+
+Inspector's scans record no pull. The job's own reads record one on
+what they read with BatchGetImage: every index, and any manifest whose
+media type ECR doesn't give. Such a manifest then looks pulled, and is
+kept.
 
 Which pulls count: a fetch of a platform image or a single manifest.
 An index's own pull time doesn't count: the job reads every index each
@@ -423,7 +430,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | <a name="input_tag_prefix_list"></a> [tag\_prefix\_list](#input\_tag\_prefix\_list) | List of tag prefixes for tagged image lifecycle rules.<br/>Only tagged images whose tag starts with one of these prefixes<br/>will be expired, e.g. ["v", "release-"] matches "v1.0", "release-2026".<br/>At least one of tag\_pattern\_list or tag\_prefix\_list is required<br/>when expire\_days\_tagged or expire\_count\_tagged is set. | `list(string)` | `null` | no |
 | <a name="input_vulnerable_image_cleanup_alarm_emails"></a> [vulnerable\_image\_cleanup\_alarm\_emails](#input\_vulnerable\_image\_cleanup\_alarm\_emails) | Email addresses that get the cleanup Lambda's alarms, through terraform-aws-lambda-monitored. Required<br/>when the cleanup is on: a failed run alarms. AWS sends each address a confirmation email to accept. | `list(string)` | `[]` | no |
 | <a name="input_vulnerable_image_cleanup_dry_run"></a> [vulnerable\_image\_cleanup\_dry\_run](#input\_vulnerable\_image\_cleanup\_dry\_run) | The cleanup only logs what it would delete, and its role has no ecr:BatchDeleteImage. Set to false to<br/>delete: a deletion can't be undone. | `bool` | `true` | no |
-| <a name="input_vulnerable_image_cleanup_enabled"></a> [vulnerable\_image\_cleanup\_enabled](#input\_vulnerable\_image\_cleanup\_enabled) | Turns on the vulnerable image cleanup: a scheduled Lambda that deletes the images Amazon Inspector<br/>reports vulnerable, at or above vulnerable\_image\_cleanup\_min\_severity with a fix available, that nothing<br/>protects. An image is protected when it carries a tag in retain\_tags, is a rollback candidate the<br/>lifecycle policy keeps, is in use or was within the soak, was pushed within the least age, or when the<br/>job can't tell whether it is in use. It judges use from Inspector's in-use data and from ECR's pull<br/>record: an image whose platform images ECR never recorded a pull of was never run, so it isn't in use.<br/>ECR refreshes the pull time at least once every 24 hours, and records a pull only in the repository that<br/>served it: put every tag something pins in retain\_tags. An image index is deleted with the manifests it<br/>references.<br/>Turned on, it runs dry until vulnerable\_image\_cleanup\_dry\_run is false. A deletion can't be undone.<br/>Off by default: false creates nothing. | `bool` | `false` | no |
+| <a name="input_vulnerable_image_cleanup_enabled"></a> [vulnerable\_image\_cleanup\_enabled](#input\_vulnerable\_image\_cleanup\_enabled) | Turns on the vulnerable image cleanup: a scheduled Lambda that deletes the images Amazon Inspector<br/>reports vulnerable, at or above vulnerable\_image\_cleanup\_min\_severity with a fix available, that nothing<br/>protects. An image is protected when it carries a tag in retain\_tags, is a rollback candidate the<br/>lifecycle policy keeps, is in use or was within the soak, was pushed within the least age, or when the<br/>job can't tell whether it is in use. It judges use from Inspector's in-use data and, without it, from<br/>ECR's pull record: an image pushed from 2022-03-03 whose platform images ECR never recorded a pull of was<br/>never run, so it isn't in use; an older one without a pull record is kept. ECR refreshes the pull time at<br/>least once every 24 hours, and records a pull only in the repository that served it: put every tag<br/>something pins in retain\_tags. An image index is deleted with the manifests it references.<br/>Turned on, it runs dry until vulnerable\_image\_cleanup\_dry\_run is false. A deletion can't be undone.<br/>Off by default: false creates nothing. | `bool` | `false` | no |
 | <a name="input_vulnerable_image_cleanup_max_deletions"></a> [vulnerable\_image\_cleanup\_max\_deletions](#input\_vulnerable\_image\_cleanup\_max\_deletions) | The most images the cleanup deletes in a run. An image index with the manifests it references counts as<br/>one image. The oldest go first; the rest wait for the next run. | `number` | `10` | no |
 | <a name="input_vulnerable_image_cleanup_min_age_days"></a> [vulnerable\_image\_cleanup\_min\_age\_days](#input\_vulnerable\_image\_cleanup\_min\_age\_days) | An image pushed within this many days is protected, so an image waiting for its pin isn't deleted. | `number` | `7` | no |
 | <a name="input_vulnerable_image_cleanup_min_severity"></a> [vulnerable\_image\_cleanup\_min\_severity](#input\_vulnerable\_image\_cleanup\_min\_severity) | The least Inspector severity that makes an image vulnerable: CRITICAL, HIGH, MEDIUM or LOW. Only ACTIVE<br/>findings with a fix available count. | `string` | `"HIGH"` | no |
