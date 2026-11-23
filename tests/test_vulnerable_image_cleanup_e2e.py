@@ -1,18 +1,22 @@
 """
-The vulnerable image cleanup end to end: real images, Inspector's real findings, real deletions.
+The vulnerable image cleanup end to end: real images, Inspector's real findings and coverage, ECR's real pull record,
+real deletions.
 
-Two images are built from an old Debian base, so Inspector reports HIGH and CRITICAL findings with fixes in both, and
-pushed as BuildKit pushes them: an index with the platform image and its attestation. One is retained. A third index
-shares the retained image's platform image.
+Three images are built from an old Debian base, so Inspector reports HIGH and CRITICAL findings with fixes in them, and
+pushed as BuildKit pushes them: an index with the platform image and its attestation. "pinned" is retained, "pulled"
+is pulled by tag with docker pull, and "candidate" is neither. A fourth index, "alias", shares the pinned platform
+image.
 
 1. ECR refuses to delete a manifest an index references.
-2. The deployed function, with deletion on, deletes nothing: the images are new, and Inspector has no in-use data for
-   an image it never saw in use, so they are protected. ECR records each read of an index as a pull of the index.
-3. The function's code, from the test, with the least age at 0 and coverage that says the images were last in use 30
-   days ago, deletes the unprotected images in order, and keeps the retained one and the manifest it shares.
+2. The test pulls "pulled", and waits for ECR to record the pull on its platform image.
+3. The deployed function, with deletion on, deletes nothing: the images are new.
+4. ECR's pull record: the reads of the indexes, the test's with the function's code and the function's, show as pulls
+   of the indexes. Neither they nor Inspector's scans show as a pull of a platform image.
+5. The function's code, from the test, with the least age at 0, reads Inspector's real coverage, which has no in-use
+   data, and ECR's pull record. It deletes the never-pulled candidate whole and the alias index alone, and keeps the
+   retained image and the pulled one.
 
-Step 3 stands in for the deployed function a month later: Inspector won't say an image it just scanned was used a
-month ago, and the module won't take a least age under a day.
+Step 5 stands in for the deployed function a week later: the module won't take a least age under a day.
 """
 
 import base64
@@ -21,6 +25,7 @@ import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from os import path as osp
+from typing import Any, Dict, Mapping, Tuple
 
 import pytest
 from pytest_infrahouse import terraform_apply
@@ -33,6 +38,7 @@ from tests.ecr_images import (
     docker_available,
     docker_login,
     list_digests,
+    pull_times,
     push_index,
     wait_for_findings,
     wait_for_pull_time,
@@ -44,23 +50,27 @@ VULNERABLE_BASE = (
     "public.ecr.aws/docker/library/debian"
     "@sha256:439cd0f6828e5930c3faec89e42e2ec06a1395a03fa459a36095f6c595c1e64d"
 )
+# How long the test waits for ECR to record a pull. ECR refreshes the pull time "at least once every 24 hours"; in
+# the test account it has shown within a minute or two.
+PULL_TIMEOUT = 1200
 
 
-def index_contents(ecr, digest):
-    manifest = json.loads(
-        ecr.batch_get_image(
-            repositoryName=REPOSITORY,
-            imageIds=[{"imageDigest": digest}],
-            acceptedMediaTypes=["application/vnd.oci.image.index.v1+json"],
-        )["images"][0]["imageManifest"]
-    )
+def index_contents(
+    manifests: Mapping[str, Mapping[str, Any]], digest: str
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """
+    :param manifests: The manifests the function's code read, by digest.
+    :param digest: A BuildKit index's digest.
+    :return: The digests of the index, its platform image and its attestation, and the platform image's descriptor.
+    """
     made = {"index": digest}
-    for entry in manifest["manifests"]:
+    descriptor = {}
+    for entry in manifests[digest]["manifests"]:
         kind = (entry.get("annotations") or {}).get("vnd.docker.reference.type")
-        made["attestation" if kind == "attestation-manifest" else "platform"] = entry[
-            "digest"
-        ]
-        if kind != "attestation-manifest":
+        if kind == "attestation-manifest":
+            made["attestation"] = entry["digest"]
+        else:
+            made["platform"] = entry["digest"]
             descriptor = {"digest": entry["digest"], "size": entry["size"]}
     return made, descriptor
 
@@ -87,6 +97,21 @@ def test_end_to_end(
         repository_url = tf_output["repository_url"]["value"]
         registry_id = tf_output["repository_arn"]["value"].split(":")[4]
         function_name = tf_output["function_name"]["value"]
+        # The deployed function's settings, but for the least age.
+        settings = selection.Settings(
+            repository_name=REPOSITORY,
+            registry_id=registry_id,
+            dry_run=False,
+            min_severity="HIGH",
+            min_age=timedelta(0),
+            soak=timedelta(days=2),
+            max_deletions=10,
+            retain_tags=frozenset({"pinned"}),
+            protect_rollback_candidates=True,
+            rollback_candidate_tag_prefix="deployed-at-",
+            rollback_candidate_retain_count=None,
+            rollback_candidate_retain_days=None,
+        )
 
         docker_login(ecr)
         builder = f"ecr-cleanup-{uuid.uuid4().hex[:8]}"
@@ -103,7 +128,7 @@ def test_end_to_end(
             check=True,
         )
         try:
-            for name in ("candidate", "pinned"):
+            for name in ("candidate", "pinned", "pulled"):
                 context = tmp_path / name
                 context.mkdir()
                 (context / "image.txt").write_text(f"{name}\n")
@@ -113,17 +138,29 @@ def test_end_to_end(
                 buildx_push(builder, str(context), f"{repository_url}:{name}")
         finally:
             subprocess.run(["docker", "buildx", "rm", builder], check=False)
+        # Read the indexes as the function does: BatchGetImage of each index, and of nothing else.
+        details = cleanup.read_images(settings, ecr)
+        manifests = cleanup.read_manifests(settings, ecr, details)
         by_tag = {
-            tags[0]: digest
-            for digest, tags in list_digests(ecr, REPOSITORY).items()
-            if tags
+            tag: detail["imageDigest"]
+            for detail in details
+            for tag in detail.get("imageTags", [])
         }
-        candidate, _ = index_contents(ecr, by_tag["candidate"])
-        pinned, pinned_platform = index_contents(ecr, by_tag["pinned"])
+        candidate, _ = index_contents(manifests, by_tag["candidate"])
+        pinned, pinned_platform = index_contents(manifests, by_tag["pinned"])
+        pulled, _ = index_contents(manifests, by_tag["pulled"])
         alias = push_index(ecr, REPOSITORY, "alias", platforms=[pinned_platform])
-        LOG.info("candidate %s, pinned %s, alias %s", candidate, pinned, alias)
+        LOG.info(
+            "candidate %s, pinned %s, pulled %s, alias %s",
+            candidate,
+            pinned,
+            pulled,
+            alias,
+        )
         wait_for_findings(
-            inspector, REPOSITORY, [candidate["platform"], pinned["platform"]]
+            inspector,
+            REPOSITORY,
+            [candidate["platform"], pinned["platform"], pulled["platform"]],
         )
         before = list_digests(ecr, REPOSITORY)
 
@@ -137,7 +174,24 @@ def test_end_to_end(
         ]
         assert list_digests(ecr, REPOSITORY) == before
 
-        # 2. The deployed function, deletion on: everything is new, so everything is kept.
+        # 2. A pull by tag, as a runtime pulls an image to run it.
+        image = f"{repository_url}:pulled"
+        subprocess.run(
+            ["docker", "pull", "--platform", "linux/amd64", image], check=True
+        )
+        subprocess.run(["docker", "image", "rm", image], check=False)
+        pulled_at = wait_for_pull_time(
+            ecr, REPOSITORY, pulled["platform"], timeout=PULL_TIMEOUT
+        )
+        LOG.info("ECR's pull time on the pulled platform image: %s", pulled_at)
+        if pulled_at is None:
+            LOG.warning(
+                "ECR recorded no pull of the pulled platform image within %d s: it counts as never pulled.",
+                PULL_TIMEOUT,
+            )
+        pull_recorded = pulled_at is not None
+
+        # 3. The deployed function, deletion on: everything is new, so everything is kept.
         lambda_client.get_waiter("function_active_v2").wait(FunctionName=function_name)
         response = lambda_client.invoke(
             FunctionName=function_name, InvocationType="RequestResponse", LogType="Tail"
@@ -147,66 +201,58 @@ def test_end_to_end(
         assert "FunctionError" not in response, payload
         LOG.info(json.dumps(payload, indent=4))
         assert payload["dry_run"] is False
-        assert payload["images_seen"] == 3
-        assert payload["vulnerable"] == 3
+        assert payload["images_seen"] == 4
+        assert payload["vulnerable"] == 4
         assert payload["protected"]["retained_tag"] == 1
-        assert payload["protected"]["recent"] == 3
+        assert payload["protected"]["recent"] == 4
+        assert payload["protected"]["in_use"] == int(pull_recorded)
+        assert payload["judged_never_pulled"] == 4 - int(pull_recorded)
         assert payload["deleted"] == 0
         assert list_digests(ecr, REPOSITORY) == before
 
-        # ECR records a BatchGetImage of an index, the test's own above as the function's, as a pull of the index,
-        # some time later. Step 3 shows that pull time doesn't protect the index: the platform images, which nothing
-        # read, carry none.
-        pulled = wait_for_pull_time(ecr, REPOSITORY, candidate["index"], timeout=1200)
-        LOG.info(
-            "ECR's pull time on the candidate index, which only BatchGetImage read: %s",
-            pulled,
+        # 4. The reads of the indexes show as pulls of the indexes. Neither they nor Inspector's scans, which found
+        # what they found in the platform images, show on a platform image or an attestation the test didn't pull.
+        index_pulled_at = wait_for_pull_time(
+            ecr, REPOSITORY, candidate["index"], timeout=PULL_TIMEOUT
         )
-        if pulled is None:
+        times = pull_times(ecr, REPOSITORY)
+        LOG.info("Pull times: %s", json.dumps(times, default=str, indent=4))
+        if index_pulled_at is None:
             LOG.warning(
-                "ECR recorded no pull time within 20 minutes; step 3 can't show it is ignored."
+                "ECR recorded no pull of the candidate index within %d s: the pull times say nothing.",
+                PULL_TIMEOUT,
             )
+        else:
+            unpulled = [
+                candidate["platform"],
+                candidate["attestation"],
+                pinned["platform"],
+                pinned["attestation"],
+            ]
+            assert [times[digest] for digest in unpulled] == [None] * len(
+                unpulled
+            ), times
 
-        # 3. The function's code a month later: deletes the candidate whole, and the alias index alone.
-        settings = selection.Settings(
-            repository_name=REPOSITORY,
-            registry_id=registry_id,
-            dry_run=False,
-            min_severity="HIGH",
-            min_age=timedelta(0),
-            soak=timedelta(days=2),
-            max_deletions=10,
-            retain_tags=frozenset({"pinned"}),
-            protect_rollback_candidates=True,
-            rollback_candidate_tag_prefix="deployed-at-",
-            rollback_candidate_retain_count=None,
-            rollback_candidate_retain_days=None,
+        # 5. The function's code a week later: Inspector's coverage and ECR's pull record, as the function reads them.
+        coverage = cleanup.read_coverage(settings, inspector)
+        LOG.info(
+            "Inspector's coverage: %s", json.dumps(coverage, default=str, indent=4)
         )
-        now = datetime.now(timezone.utc)
-        details = cleanup.read_images(settings, ecr)
-        repository = selection.Repository.build(
-            details, cleanup.read_manifests(settings, ecr, details)
-        )
-        coverage = [
-            {
-                "resourceType": "AWS_ECR_CONTAINER_IMAGE",
-                "resourceId": f"arn:aws:ecr:{aws_region}:{registry_id}:repository/{REPOSITORY}/{digest}",
-                "resourceMetadata": {
-                    "ecrImage": {
-                        "inUseCount": 0,
-                        "lastInUseAt": now - timedelta(days=30),
-                    }
-                },
-            }
-            for digest in repository.images
-            if repository.is_runnable(digest)
-        ]
-        evidence = selection.Evidence.build(
-            cleanup.read_findings(settings, inspector), coverage, settings
-        )
-        summary = cleanup.execute(
-            settings, ecr, selection.plan(repository, evidence, settings, now)
-        )
+        cleanup.check_models(ecr, inspector)
+        plan = cleanup.decide(settings, ecr, inspector, datetime.now(timezone.utc))
+        verdicts = {verdict.unit.root: verdict for verdict in plan.verdicts}
+        for root in (candidate["index"], alias):
+            # Judged from ECR's pull record: Inspector gives no in-use data on an image it never saw in use.
+            assert verdicts[root].use_judged_by == selection.JUDGED_BY_PULL_RECORD
+            assert verdicts[root].never_pulled
+            assert not verdicts[root].reasons
+        assert selection.RETAINED_TAG in verdicts[pinned["index"]].reasons
+        if pull_recorded:
+            assert verdicts[pulled["index"]].reasons == {selection.IN_USE}
+            assert not verdicts[pulled["index"]].never_pulled
+        summary = cleanup.execute(settings, ecr, plan)
         LOG.info(json.dumps(summary, indent=4))
-        assert summary["deleted"] == 2
-        assert sorted(list_digests(ecr, REPOSITORY)) == sorted(pinned.values())
+        # The candidate and the alias index; and the pulled image, if ECR didn't show its pull in time.
+        assert summary["deleted"] == 3 - int(pull_recorded)
+        kept = list(pinned.values()) + (list(pulled.values()) if pull_recorded else [])
+        assert sorted(list_digests(ecr, REPOSITORY)) == sorted(kept)

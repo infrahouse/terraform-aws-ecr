@@ -71,14 +71,14 @@ def put_manifest(
     return {"digest": digest, "size": len(body)}
 
 
-def push_synthetic_index(
-    ecr: Any, repository: str, name: str, tag: str
-) -> Dict[str, str]:
+def push_synthetic_platform(
+    ecr: Any, repository: str, name: str, tag: Optional[str] = None
+) -> Dict[str, Any]:
     """
-    Push an index as BuildKit does, without Docker: a platform image with one tiny layer and no OS, so Inspector
-    finds nothing in it, and an attestation.
+    Push a platform image without Docker: one tiny layer and no OS, so Inspector finds nothing in it. Tagged, it is
+    a single-manifest image.
 
-    :return: The digests of the index, the platform image and the attestation, and the platform image's descriptor.
+    :return: Its descriptor: the digest and the size.
     """
     tar_bytes = io.BytesIO()
     with tarfile.open(fileobj=tar_bytes, mode="w") as tar:
@@ -95,7 +95,7 @@ def push_synthetic_index(
             "rootfs": {"type": "layers", "diff_ids": [sha256(tar_bytes.getvalue())]},
         }
     ).encode()
-    platform = put_manifest(
+    return put_manifest(
         ecr,
         repository,
         {
@@ -104,7 +104,20 @@ def push_synthetic_index(
             "config": dict(upload_blob(ecr, repository, config), mediaType=OCI_CONFIG),
             "layers": [dict(upload_blob(ecr, repository, layer), mediaType=OCI_LAYER)],
         },
+        tag,
     )
+
+
+def push_synthetic_index(
+    ecr: Any, repository: str, name: str, tag: str
+) -> Dict[str, str]:
+    """
+    Push an index as BuildKit does, without Docker: a platform image with one tiny layer and no OS, so Inspector
+    finds nothing in it, and an attestation.
+
+    :return: The digests of the index, the platform image and the attestation, and the platform image's descriptor.
+    """
+    platform = push_synthetic_platform(ecr, repository, name)
     statement = json.dumps(
         {"_type": "https://in-toto.io/Statement/v0.1", "subject": [{"name": name}]}
     ).encode()
@@ -303,3 +316,16 @@ def wait_for_pull_time(
         if time.time() > deadline:
             return None
         time.sleep(30)
+
+
+def pull_times(ecr: Any, repository: str) -> Dict[str, Optional[Any]]:
+    """
+    :return: ECR's lastRecordedPullTime of every image in the repository, by digest; None for an image without one.
+    """
+    times = {}
+    for page in ecr.get_paginator("describe_images").paginate(
+        repositoryName=repository, filter={"tagStatus": "ANY", "imageStatus": "ANY"}
+    ):
+        for detail in page["imageDetails"]:
+            times[detail["imageDigest"]] = detail.get("lastRecordedPullTime")
+    return times

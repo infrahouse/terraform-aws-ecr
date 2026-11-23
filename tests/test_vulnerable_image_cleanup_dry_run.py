@@ -1,10 +1,13 @@
 """
 The vulnerable image cleanup, on and dry, in a repository with nothing vulnerable: the function runs, selects nothing,
-and its role can't delete.
+and its role can't delete. Its reads record a pull of each index it reads, and of nothing else: the cleanup judges an
+image whose platform image or single manifest ECR never recorded a pull of as never run, so its own reads mustn't
+record one there.
 """
 
 import base64
 import json
+from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from os import path as osp
 from typing import Any, List
@@ -13,7 +16,14 @@ import pytest
 from pytest_infrahouse import terraform_apply
 
 from tests.conftest import LOG, TERRAFORM_ROOT_DIR, prepare_terraform_root
-from tests.ecr_images import list_digests, push_index, push_synthetic_index
+from tests.ecr_images import (
+    list_digests,
+    pull_times,
+    push_index,
+    push_synthetic_index,
+    push_synthetic_platform,
+    wait_for_pull_time,
+)
 
 REPOSITORY = "test-cleanup-dry-run"
 
@@ -66,13 +76,29 @@ def test_dry_run_in_a_clean_repository(
         lambda_client = boto3_session.client("lambda", region_name=aws_region)
         function_name = tf_output["function_name"]["value"]
 
-        # Indexes as BuildKit pushes them, one retained, and one that shares a platform image with another index.
-        push_synthetic_index(ecr, REPOSITORY, "pinned", "pinned")
+        # Indexes as BuildKit pushes them, one retained, and one that shares a platform image with another index; and
+        # a single manifest. Pushes record no pull, and nothing but the function reads an image.
+        pinned = push_synthetic_index(ecr, REPOSITORY, "pinned", "pinned")
         other = push_synthetic_index(ecr, REPOSITORY, "other", "abc1234")
-        push_index(ecr, REPOSITORY, "alias", platforms=[other["platform_descriptor"]])
+        alias = push_index(
+            ecr, REPOSITORY, "alias", platforms=[other["platform_descriptor"]]
+        )
+        single = push_synthetic_platform(ecr, REPOSITORY, "single", "single")["digest"]
+        names = {
+            pinned["index"]: "pinned index",
+            pinned["platform"]: "pinned platform image",
+            pinned["attestation"]: "pinned attestation",
+            other["index"]: "other index",
+            other["platform"]: "other platform image, which alias shares",
+            other["attestation"]: "other attestation",
+            alias: "alias index",
+            single: "single manifest",
+        }
         before = list_digests(ecr, REPOSITORY)
+        assert not any(pull_times(ecr, REPOSITORY).values())
 
         lambda_client.get_waiter("function_active_v2").wait(FunctionName=function_name)
+        invoked_at = datetime.now(timezone.utc)
         response = lambda_client.invoke(
             FunctionName=function_name, InvocationType="RequestResponse", LogType="Tail"
         )
@@ -81,13 +107,43 @@ def test_dry_run_in_a_clean_repository(
         assert "FunctionError" not in response, payload
         LOG.info(json.dumps(payload, indent=4))
         assert payload["dry_run"] is True
-        assert payload["images_seen"] == 3
-        assert payload["manifests_seen"] == 7
+        assert payload["images_seen"] == 4
+        assert payload["manifests_seen"] == 8
         assert payload["vulnerable"] == 0
         assert payload["candidates"] == 0
         assert payload["deleted"] == 0
         assert payload["would_delete"] == 0
         assert list_digests(ecr, REPOSITORY) == before
+
+        # The function read each index with BatchGetImage, and ECR records that as a pull of the index. Once it shows
+        # on one index, the platform images, the single manifest and the attestations, which the function didn't
+        # read, still have none.
+        pulled = wait_for_pull_time(ecr, REPOSITORY, pinned["index"], timeout=1200)
+        times = pull_times(ecr, REPOSITORY)
+        LOG.info(
+            "Pull times after the function's run at %s: %s",
+            invoked_at.isoformat(),
+            json.dumps(
+                {names[digest]: times[digest] for digest in names},
+                default=str,
+                indent=4,
+            ),
+        )
+        if pulled is None:
+            LOG.warning(
+                "ECR recorded no pull of the index the function read within 20 minutes: the pull times say nothing."
+            )
+        else:
+            # The pull is the function's: nothing read the index before it ran.
+            assert pulled >= invoked_at - timedelta(minutes=1)
+            unread = [
+                pinned["platform"],
+                other["platform"],
+                single,
+                pinned["attestation"],
+                other["attestation"],
+            ]
+            assert [times[digest] for digest in unread] == [None] * len(unread), times
 
         # A dry run's role can't delete.
         iam = boto3_session.client("iam")
