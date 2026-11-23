@@ -15,10 +15,11 @@ in `locals.tf`) that creates AWS ECR repositories with configurable lifecycle
 policies for automatic image expiration, and an opt-in Lambda that
 deletes the images Inspector reports vulnerable.
 
-Requires Terraform ~> 1.9, AWS provider >= 5.31, < 7.0, and the `null`
+Requires Terraform ~> 1.9, AWS provider >= 6.0, < 7.0, and the `null`
 and `time` providers: what `lambda-monitored`, which runs the cleanup,
-needs. Terraform installs a module's providers whether its count is 0 or
-not, so the floor applies to every caller, with the cleanup on or off.
+needs (its `s3-bucket` needs AWS 6.0). Terraform installs a module's
+providers whether its count is 0 or not, so the floor applies to every
+caller, with the cleanup on or off. AWS provider 5 is not supported.
 
 ## Architecture
 
@@ -97,7 +98,7 @@ The rules, which must stay right:
 
 Run a single test with a specific provider version:
 ```
-pytest -xvvs tests/test_module.py -k "aws-5"
+pytest -xvvs tests/test_module.py -k "aws-6"
 ```
 
 Default test region: `us-west-2`. Default test role: `arn:aws:iam::303467602807:role/ecr-tester`.
@@ -112,10 +113,10 @@ Tests in `tests/test_module.py` are integration tests that create real
 AWS infrastructure. They use `pytest-infrahouse` fixtures
 (`terraform_apply`, `test_role_arn`, `keep_after`, `aws_region`).
 
-Tests are parametrized to run against both AWS provider v5 (`~> 5.31`)
-and v6 (`~> 6.0`). The test dynamically writes `terraform.tf` and
-`terraform.tfvars` into `test_data/test_module/` to configure the
-provider version and region.
+Tests are parametrized on the AWS provider version, now v6 (`~> 6.0`)
+only: the module needs AWS 6.0. The test dynamically writes
+`terraform.tf` and `terraform.tfvars` into `test_data/test_module/` to
+configure the provider version and region.
 
 The test module in `test_data/test_module/` is a working Terraform root
 module that calls the ECR module at `../../` (the repo root). It sets
