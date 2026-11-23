@@ -20,8 +20,22 @@ candidate retention.
   being pruned by lifecycle policies
 - Retained tags: protect images that something pins by tag, such as a
   scheduled task's image, from every other rule
-- Fully backward compatible — rollback candidates and retained tags
-  are opt-in
+- Vulnerable image cleanup: an opt-in scheduled job that deletes the
+  images Amazon Inspector reports vulnerable and that nothing protects
+- Rollback candidates, retained tags and the cleanup are opt-in
+
+## Requirements
+
+- Terraform 1.9 or later
+- AWS provider 5.31 or later, below 7.0
+- The `null` and `time` providers
+
+The vulnerable image cleanup runs as
+[terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored),
+which needs this floor. Terraform installs a module's providers whether
+the module is used or not, so the floor applies to every caller, with
+the cleanup on or off. Earlier releases of this module needed Terraform
+1.5 and AWS provider 5.11.
 
 ## Quick Start
 
@@ -182,6 +196,117 @@ after deployment (via `PutImage`). This means a principal with
 `ecr:PutImage` permission could retag a malicious image to look
 like a known-good deployment. Mitigate this by restricting
 `ecr:PutImage` to the deployment Lambda role only.
+
+## Vulnerable image cleanup
+
+Amazon Inspector reports a vulnerability in every image it still
+monitors, used or not. A repository that keeps an image per commit
+carries one report per old image long after a fixed image runs, until
+the lifecycle policy expires it. The cleanup is a scheduled Lambda that
+deletes those images sooner.
+
+It is off by default, and creates nothing until
+`vulnerable_image_cleanup_enabled` is true. Turned on, it runs dry until
+`vulnerable_image_cleanup_dry_run` is false.
+
+```hcl
+module "my_service_ecr" {
+    source  = "registry.infrahouse.com/infrahouse/ecr/aws"
+    version = "0.8.0"
+
+    repo_name    = "my-service-repo"
+    environment  = "production"
+    service_name = "my-service"
+
+    rollback_candidate_retain_count = 3
+    expire_count_tagged             = 30
+    tag_pattern_list                = ["*"]
+    retain_tags                     = [var.migrator_image_tag, var.docker_image_tag]
+
+    vulnerable_image_cleanup_enabled      = true
+    vulnerable_image_cleanup_alarm_emails = ["ops@example.com"]
+    # Delete only once the dry runs' logs show the right images:
+    # vulnerable_image_cleanup_dry_run = false
+}
+```
+
+### What it deletes
+
+An image that Inspector reports vulnerable, with an ACTIVE finding at or
+above `vulnerable_image_cleanup_min_severity` (default `HIGH`) that has a
+fix available, when nothing protects it. An image index is deleted with
+the manifests it references, its platform images and its attestation,
+and counts as one image.
+
+### What it keeps
+
+An image is protected, and kept, when any of these hold:
+
+- It carries a tag in `retain_tags`.
+- It is a rollback candidate the lifecycle policy keeps: the newest
+  `rollback_candidate_retain_count` images with a tag that starts with
+  `rollback_candidate_tag_prefix`, counting retained images, or those
+  pushed within `rollback_candidate_retain_days`. Only while
+  `vulnerable_image_cleanup_protect_rollback_candidates` is true (the
+  default), and only when one of the two is set, as the lifecycle policy
+  has no rollback candidate rule otherwise.
+- It is in use: Inspector counts a running ECS task or EKS pod that uses
+  it, or it was in use or pulled within `vulnerable_image_cleanup_soak_days`
+  (default 2), by Inspector's `lastInUseAt` or ECR's
+  `lastRecordedPullTime`. An index's own pull time doesn't count: the
+  job reads every index each run, and ECR records that read as a pull.
+  A real pull records the index's platform image too, and that counts.
+- It was pushed within `vulnerable_image_cleanup_min_age_days` (default
+  7), so an image waiting for its pin isn't deleted.
+- It isn't ACTIVE: an archived image.
+- The job can't tell whether it is in use: a platform image without an
+  Inspector coverage record, or whose record lacks `inUseCount` or
+  `lastInUseAt`. Inspector leaves both out for an image it has never seen
+  in use, so the cleanup keeps such an image, and the lifecycle policy
+  remains what removes it.
+
+A reason that holds for any manifest of an index protects the whole
+index, and an index that is kept keeps every manifest it references:
+when two indexes share a platform image and one is kept, the other is
+deleted and the shared image stays.
+
+When the job can't judge, it deletes nothing: an API error, throttling
+that outlasts the retries, or a page or manifest it can't read fails the
+run before any deletion, and the Lambda's alarm emails
+`vulnerable_image_cleanup_alarm_emails`.
+
+### Dry run, and turning deletion on
+
+In a dry run the function logs what it would delete and deletes nothing;
+its role has no `ecr:BatchDeleteImage` at all. Each run logs, as JSON:
+
+- one line per image deleted, or that would be (`"action": "deleted"` or
+  `"would_delete"`), with its digests, tags, push time, last use and
+  pull, and the CVE ids;
+- one line per vulnerable image kept, with its `reasons`, and one per
+  image the cap leaves for a later run (`"left_by_cap"`);
+- one summary line: images seen, vulnerable, protected by each reason,
+  deleted, and left by the cap.
+
+Read the dry runs' lines in the function's log group. When they name
+only images you can do without, set `vulnerable_image_cleanup_dry_run =
+false`. Each run then deletes at most
+`vulnerable_image_cleanup_max_deletions` images (default 10), the oldest
+first; the schedule is `vulnerable_image_cleanup_schedule` (default
+daily).
+
+**A deletion can't be undone.** An image a service still needs and that
+nothing protects is gone: that service's next task can't start. Put every
+tag an environment pins, such as a scheduled task's image or a
+production pin, in `retain_tags`.
+
+### What it needs
+
+- Inspector's ECR scanning, in the repository's account and Region.
+- One alarm email at least, in `vulnerable_image_cleanup_alarm_emails`:
+  AWS sends each address a confirmation to accept.
+- Where Terraform runs: `python3`, `pip3`, the AWS CLI and `jq`.
+  terraform-aws-lambda-monitored builds the function's package there.
 
 ## Documentation
 

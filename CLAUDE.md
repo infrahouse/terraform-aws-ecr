@@ -12,12 +12,17 @@ This contains InfraHouse's comprehensive coding standards for Terraform, Python,
 
 This is an InfraHouse Terraform module (`infrahouse/ecr/aws`, version tracked
 in `locals.tf`) that creates AWS ECR repositories with configurable lifecycle
-policies for automatic image expiration. Requires Terraform ~> 1.5 and
-AWS provider >= 5.11, < 7.0.
+policies for automatic image expiration, and an opt-in Lambda that
+deletes the images Inspector reports vulnerable.
+
+Requires Terraform ~> 1.9, AWS provider >= 5.31, < 7.0, and the `null`
+and `time` providers: what `lambda-monitored`, which runs the cleanup,
+needs. Terraform installs a module's providers whether its count is 0 or
+not, so the floor applies to every caller, with the cleanup on or off.
 
 ## Architecture
 
-The module has two main concerns split across files:
+The module has three concerns split across files:
 
 - **main.tf** creates the `aws_ecr_repository.repo` resource
 - **policy.tf** builds a lifecycle policy using
@@ -37,12 +42,53 @@ filtering. Untagged rules (`expire_days_untagged` /
 Default tags (environment, service, created_by_module, module_version)
 are defined in `locals.tf` and merged onto the ECR repository.
 
+### Vulnerable image cleanup
+
+- **vulnerable_image_cleanup.tf**: with `count`, off by default
+  (`vulnerable_image_cleanup_enabled`): `lambda-monitored` 2.2.1, its IAM
+  policy (from a policy document), and an EventBridge rule, target and
+  Lambda permission for the schedule. `ecr:DescribeImages` and
+  `ecr:BatchGetImage` on the repository; `ecr:BatchDeleteImage` on it
+  only when `vulnerable_image_cleanup_dry_run` is false;
+  `inspector2:ListFindings` and `inspector2:ListCoverage` on `*`.
+- **vulnerable_image_cleanup/cleanup.py**: the handler and the AWS I/O:
+  reads ECR (every image, every index's manifest) and Inspector
+  (findings, coverage), then deletes or, dry, only logs.
+- **vulnerable_image_cleanup/selection.py**: the rules, as pure Python
+  over botocore-shaped answers.
+- **vulnerable_image_cleanup/requirements.txt**: `boto3 ~= 1.41`, the
+  first release whose botocore models Inspector's `inUseCount` and
+  `lastInUseAt` and ECR's `imageStatus`. Botocore drops fields its model
+  lacks; `check_models()` fails the run if they're missing.
+
+The rules, which must stay right:
+
+- An image index and the manifests it references form one unit, judged,
+  capped and deleted as one image. A reason that holds for any of its
+  manifests protects the unit; a kept index keeps all it references.
+- Protected: a tag in `retain_tags`; a rollback candidate the lifecycle
+  keeps (same prefix, count and days as `policy.tf`, push time newest
+  first, retained images counted, ACTIVE images only, either rule
+  keeping), while `vulnerable_image_cleanup_protect_rollback_candidates`;
+  in use (`inUseCount` > 0, or `lastInUseAt` or ECR's
+  `lastRecordedPullTime` within the soak; an index's own pull time
+  doesn't count, as ECR records the job's BatchGetImage of it as a
+  pull, while a real pull records its platform image's too); pushed
+  within the least age;
+  not ACTIVE; in-use data missing for a platform image.
+- Fail closed: any API error, failed page or unreadable manifest raises
+  before a deletion. ECR's `ImageReferencedByManifestList` or any other
+  refusal (but `ImageNotFound`) fails the run.
+- Deletion order: the index alone, then its manifests that no index
+  still in the repository references, level by level. Oldest first, up
+  to `vulnerable_image_cleanup_max_deletions`.
+
 ## Build and Development Commands
 
 | Command | Purpose |
 |---------|---------|
 | `make bootstrap` | Install Python dependencies (assumes virtualenv) |
-| `make format` | Format with `terraform fmt -recursive` and `black tests` |
+| `make format` | Format with `terraform fmt -recursive` and `black tests vulnerable_image_cleanup` |
 | `make lint` | Check formatting (non-modifying) |
 | `make test` | Run full test suite |
 | `make test-keep` | Run tests, keep AWS infrastructure for debugging |
@@ -55,6 +101,10 @@ pytest -xvvs tests/test_module.py -k "aws-5"
 ```
 
 Default test region: `us-west-2`. Default test role: `arn:aws:iam::303467602807:role/ecr-tester`.
+
+`make test-clean TEST_PATH=tests/<file>.py` needs `TEST_FILTER=aws-6` on
+the command line: the Makefile's default filter carries quotes that
+break `-k`.
 
 ## Testing
 
@@ -71,8 +121,23 @@ The test module in `test_data/test_module/` is a working Terraform root
 module that calls the ECR module at `../../` (the repo root). It sets
 the `created_by` tag in provider `default_tags`.
 
-Python dependencies: `infrahouse-core ~= 0.17`,
-`pytest-infrahouse ~= 0.15`.
+The vulnerable image cleanup's tests:
+
+- `tests/test_vulnerable_image_cleanup.py`: unit tests, no AWS. Run them
+  with plain `pytest tests/test_vulnerable_image_cleanup.py`. botocore's
+  Stubber serves model-checked answers and fails any unexpected call,
+  such as a delete in a dry run.
+- `tests/test_vulnerable_image_cleanup_dry_run.py`
+  (`test_data/vulnerable_image_cleanup_dry_run/`): on and dry, a
+  repository with nothing vulnerable; reads the role's policies.
+- `tests/test_vulnerable_image_cleanup_e2e.py`
+  (`test_data/vulnerable_image_cleanup_e2e/`): needs `docker buildx`;
+  pushes images from an old Debian base, waits for Inspector, and checks
+  ECR's refusal, the deployed function, and deletion.
+- `tests/test_module.py` checks the cleanup creates nothing when off.
+- `tests/ecr_images.py`: helpers that push images.
+
+Python dependencies: see `requirements.txt`.
 
 ## CI/CD
 
