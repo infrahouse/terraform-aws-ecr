@@ -8,13 +8,14 @@ is pulled by tag with docker pull, and "candidate" is neither. A fourth index, "
 image.
 
 1. ECR refuses to delete a manifest an index references.
-2. The test pulls "pulled", and waits for ECR to record the pull on its platform image.
+2. The test pulls "pulled", and waits until ECR's answers agree on the pull of its platform image. For about five
+   minutes after a first pull shows, one read shows it and the next may not, so one read that shows it isn't enough.
 3. The deployed function, with deletion on, deletes nothing: the images are new.
 4. ECR's pull record: the reads of the indexes, the test's with the function's code and the function's, show as pulls
    of the indexes. Neither they nor Inspector's scans show as a pull of a platform image.
 5. The function's code, from the test, with the least age at 0, reads Inspector's real coverage, which has no in-use
-   data, and ECR's pull record. It deletes the never-pulled candidate whole and the alias index alone, and keeps the
-   retained image and the pulled one.
+   data, and ECR's pull record, and reads the images it judged never pulled again before deleting. It deletes the
+   never-pulled candidate whole and the alias index alone, and keeps the retained image and the pulled one.
 
 Step 5 stands in for the deployed function a week later: the module won't take a least age under a day.
 """
@@ -42,6 +43,7 @@ from tests.ecr_images import (
     push_index,
     wait_for_findings,
     wait_for_pull_time,
+    wait_for_settled_pull_time,
 )
 
 REPOSITORY = "test-cleanup-e2e"
@@ -53,6 +55,9 @@ VULNERABLE_BASE = (
 # How long the test waits for ECR to record a pull. ECR refreshes the pull time "at least once every 24 hours"; in
 # the test account it has shown within a minute or two.
 PULL_TIMEOUT = 1200
+# How long every read must show a pull before the test counts on it: in the test account, inside the five minutes
+# ECR's answers flap, every read showed a pull for up to 70 s at a time before one lost it again.
+PULL_QUIET = 180
 
 
 def index_contents(
@@ -180,16 +185,14 @@ def test_end_to_end(
             ["docker", "pull", "--platform", "linux/amd64", image], check=True
         )
         subprocess.run(["docker", "image", "rm", image], check=False)
-        pulled_at = wait_for_pull_time(
-            ecr, REPOSITORY, pulled["platform"], timeout=PULL_TIMEOUT
+        pulled_at = wait_for_settled_pull_time(
+            ecr, REPOSITORY, pulled["platform"], quiet=PULL_QUIET, timeout=PULL_TIMEOUT
         )
-        LOG.info("ECR's pull time on the pulled platform image: %s", pulled_at)
-        if pulled_at is None:
-            LOG.warning(
-                "ECR recorded no pull of the pulled platform image within %d s: it counts as never pulled.",
-                PULL_TIMEOUT,
-            )
-        pull_recorded = pulled_at is not None
+        LOG.info("ECR's settled pull time on the pulled platform image: %s", pulled_at)
+        # If ECR's answers never agree, the pull record can't be read reliably, and the rule rests on reading it.
+        assert (
+            pulled_at is not None
+        ), f"ECR's answers didn't show the pull for {PULL_QUIET} s in a row within {PULL_TIMEOUT} s"
 
         # 3. The deployed function, deletion on: everything is new, so everything is kept.
         lambda_client.get_waiter("function_active_v2").wait(FunctionName=function_name)
@@ -205,8 +208,8 @@ def test_end_to_end(
         assert payload["vulnerable"] == 4
         assert payload["protected"]["retained_tag"] == 1
         assert payload["protected"]["recent"] == 4
-        assert payload["protected"]["in_use"] == int(pull_recorded)
-        assert payload["judged_never_pulled"] == 4 - int(pull_recorded)
+        assert payload["protected"]["in_use"] == 1
+        assert payload["judged_never_pulled"] == 3
         assert payload["deleted"] == 0
         assert list_digests(ecr, REPOSITORY) == before
 
@@ -247,12 +250,15 @@ def test_end_to_end(
             assert verdicts[root].never_pulled
             assert not verdicts[root].reasons
         assert selection.RETAINED_TAG in verdicts[pinned["index"]].reasons
-        if pull_recorded:
-            assert verdicts[pulled["index"]].reasons == {selection.IN_USE}
-            assert not verdicts[pulled["index"]].never_pulled
+        assert verdicts[pulled["index"]].reasons == {selection.IN_USE}
+        assert not verdicts[pulled["index"]].never_pulled
+        # The reads again, of the candidate's and the alias's platform images, find no pull.
+        assert plan.pulled_on_recheck == ()
         summary = cleanup.execute(settings, ecr, plan)
         LOG.info(json.dumps(summary, indent=4))
-        # The candidate and the alias index; and the pulled image, if ECR didn't show its pull in time.
-        assert summary["deleted"] == 3 - int(pull_recorded)
-        kept = list(pinned.values()) + (list(pulled.values()) if pull_recorded else [])
-        assert sorted(list_digests(ecr, REPOSITORY)) == sorted(kept)
+        # The candidate, and the alias index alone.
+        assert summary["deleted"] == 2
+        assert summary["pulled_on_recheck"] == 0
+        assert sorted(list_digests(ecr, REPOSITORY)) == sorted(
+            list(pinned.values()) + list(pulled.values())
+        )
