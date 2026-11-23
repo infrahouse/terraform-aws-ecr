@@ -289,6 +289,15 @@ not in use, and deletes it if nothing else protects it. That holds for
 an image pushed from 2022-03-03; an older one without a pull record is
 kept, as above.
 
+One answer without a pull time isn't enough to delete. After a first
+pull shows, ECR's answers flap for about five minutes: one read shows
+the pull, the next may not. So before it deletes, or in a dry run logs,
+the job reads every image it judged never pulled again, 13 times, 10
+seconds apart. If any read shows a pull, it judges the image again with
+that pull, and keeps it. Each run logs a `"recheck"` line with what it
+read again and the pulls it found, and the summary counts them
+(`pulled_on_recheck`).
+
 Inspector's scans record no pull. The job's own reads record one on
 what they read with BatchGetImage: every index, and any manifest whose
 media type ECR doesn't give. Such a manifest then looks pulled, and is
@@ -297,7 +306,9 @@ kept.
 Which pulls count: a fetch of a platform image or a single manifest.
 An index's own pull time doesn't count: the job reads every index each
 run, and ECR records that read as a pull. An attestation's doesn't
-either: a runtime doesn't fetch one to run the image. A client that
+either: a pull that fetches the attestation, as `docker pull` may,
+fetches the platform image too, whose pull counts, and a tool such as a
+scanner may fetch the attestation alone. A client that
 already has the platform image, such as an EKS node or a host that ran
 the image before, may fetch only the index; the pull that brought the
 platform image to it is on record, and keeps the image.
@@ -308,7 +319,8 @@ What ECR's pull record doesn't show, so put every tag something pins in
 - A first pull within the last day. ECR refreshes the pull time "at
   least once every 24 hours", so an old image deployed for the first
   time within the last day, say for a rollback, may not show its pull
-  yet.
+  yet. In the test account a pull showed within a minute, and then
+  flapped for about five minutes; a run in that minute doesn't see it.
 - A pull from elsewhere. ECR records a pull on the image in the
   repository that served it: a replica in another Region or account, or
   the same image pulled from another repository and cached on a host,

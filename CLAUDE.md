@@ -54,7 +54,8 @@ are defined in `locals.tf` and merged onto the ECR repository.
   `inspector2:ListFindings` and `inspector2:ListCoverage` on `*`.
 - **vulnerable_image_cleanup/cleanup.py**: the handler and the AWS I/O:
   reads ECR (every image, every index's manifest) and Inspector
-  (findings, coverage), then deletes or, dry, only logs.
+  (findings, coverage), decides, reads again the images judged never
+  pulled (`recheck_pulls`), then deletes or, dry, only logs.
 - **vulnerable_image_cleanup/selection.py**: the rules, as pure Python
   over botocore-shaped answers.
 - **vulnerable_image_cleanup/requirements.txt**: `boto3 ~= 1.41`, the
@@ -88,6 +89,13 @@ The rules, which must stay right:
   which counts for every index. ECR refreshes the pull time at least
   daily and records a pull only in the repository that served it: the
   docs tell callers to put pinned tags in `retain_tags`.
+- Read again before deleting: DescribeImages answers flap for about five
+  minutes after a first pull shows (in the test account, 22% to 60% of
+  reads lost it, in runs of up to 18 s). So `decide` reads every
+  candidate's never-pulled manifests again, the cap's leftovers
+  included, `RECHECK_READS` (13) times, `RECHECK_INTERVAL` (10 s) apart,
+  and judges again with any pull it finds; a found pull only adds
+  protection, so one round is enough. Dry runs read again too.
 - Fail closed: any API error, failed page or unreadable manifest raises
   before a deletion. ECR's `ImageReferencedByManifestList` or any other
   refusal (but `ImageNotFound`) fails the run, after a `delete_failed`
@@ -147,10 +155,12 @@ The vulnerable image cleanup's tests:
 - `tests/test_vulnerable_image_cleanup_e2e.py`
   (`test_data/vulnerable_image_cleanup_e2e/`): needs `docker buildx`;
   pushes images from an old Debian base, pulls one with `docker pull`,
-  waits for Inspector and ECR's pull record, and checks ECR's refusal,
-  the deployed function, that neither the reads nor Inspector's scans
-  record a pull of a platform image, and deletion, reading Inspector's
-  real coverage with the function's code.
+  waits for Inspector, and for ECR's answers to agree on that pull for
+  3 minutes in a row (one read showing it isn't enough), and checks
+  ECR's refusal, the deployed function, that neither the reads nor
+  Inspector's scans record a pull of a platform image, and deletion,
+  reading Inspector's real coverage with the function's code, the reads
+  again included.
 - `tests/test_module.py` checks the cleanup creates nothing when off.
 - `tests/ecr_images.py`: helpers that push images.
 
