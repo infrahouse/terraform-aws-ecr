@@ -72,14 +72,17 @@ The rules, which must stay right:
   first, retained images counted, ACTIVE images only, either rule
   keeping), while `vulnerable_image_cleanup_protect_rollback_candidates`;
   in use (`inUseCount` > 0, or `lastInUseAt` or ECR's
-  `lastRecordedPullTime` within the soak; an index's own pull time
-  doesn't count, as ECR records the job's BatchGetImage of it as a
-  pull, while a real pull records its platform image's too); pushed
+  `lastRecordedPullTime` of a platform image or single manifest within
+  the soak; an index's own pull time doesn't count, as ECR records the
+  job's BatchGetImage of it as a pull, so a pull that fetches only the
+  index, e.g. by a client with the platform image cached, isn't seen,
+  and only Inspector's in-use data or `retain_tags` protect it); pushed
   within the least age;
   not ACTIVE; in-use data missing for a platform image.
 - Fail closed: any API error, failed page or unreadable manifest raises
   before a deletion. ECR's `ImageReferencedByManifestList` or any other
-  refusal (but `ImageNotFound`) fails the run.
+  refusal (but `ImageNotFound`) fails the run, after a `delete_failed`
+  line names the digests ECR deleted (`DeletionError.deleted`).
 - Deletion order: the index alone, then its manifests that no index
   still in the repository references, level by level. Oldest first, up
   to `vulnerable_image_cleanup_max_deletions`.

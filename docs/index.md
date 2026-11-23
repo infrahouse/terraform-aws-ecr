@@ -30,9 +30,13 @@ An image is protected when any of these hold:
 - it carries a tag in `retain_tags`;
 - it is a rollback candidate the lifecycle policy keeps (the same tag prefix, count and days as its rules; a retained
   image counts toward the count), while `vulnerable_image_cleanup_protect_rollback_candidates` is true;
-- it is in use, or was used or pulled within `vulnerable_image_cleanup_soak_days`, by Inspector's `inUseCount` and
-  `lastInUseAt` and ECR's `lastRecordedPullTime`. An index's own pull time doesn't count, since ECR records the job's
-  read of each index as a pull; a real pull records the index's platform image too, and that counts;
+- it is in use, or was used within `vulnerable_image_cleanup_soak_days`, by Inspector's `inUseCount` and
+  `lastInUseAt`; or ECR's `lastRecordedPullTime` says its platform image, or a single-manifest image, was pulled within
+  the soak. Only a fetch of a platform image or single manifest counts as a pull. An index's own pull time doesn't
+  count, since ECR records the job's read of each index as a pull, so a pull that fetches only the index isn't seen. A
+  fresh `docker pull` fetches the platform image too; a client that already has it, such as an EKS node or a host that
+  ran the image before, may fetch only the index, and then only Inspector's in-use data protects the image. Put every
+  tag something pins in `retain_tags` rather than rely on a recent pull;
 - it was pushed within `vulnerable_image_cleanup_min_age_days`;
 - it is archived;
 - the job can't tell whether it is in use: no Inspector coverage record, or one without `inUseCount` and
@@ -48,7 +52,8 @@ Turned on, it runs dry: it logs a JSON line per image it would delete, with its 
 and pull, and CVE ids, a line per vulnerable image it keeps, with the reasons, and a summary line. Its role has no
 `ecr:BatchDeleteImage`. Read the dry runs' lines in the function's log group, and once they name only images you can
 do without, set `vulnerable_image_cleanup_dry_run = false`. A run then deletes at most
-`vulnerable_image_cleanup_max_deletions` images (default 10), the oldest first.
+`vulnerable_image_cleanup_max_deletions` images (default 10), the oldest first. A deletion that fails part way logs
+a `delete_failed` line naming the image, the digests ECR did delete and the error, and then the run fails.
 
 **A deletion can't be undone.** An image a service still needs and that nothing protects is gone, and that service's
 next task can't start. Put every tag an environment pins in `retain_tags`.

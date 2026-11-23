@@ -246,8 +246,11 @@ variable "vulnerable_image_cleanup_min_age_days" {
 
 variable "vulnerable_image_cleanup_soak_days" {
   description = <<-EOT
-    An image in use, or used or pulled within this many days, is protected, so a rollback can go back to it.
-    Inspector's lastInUseAt and ECR's lastRecordedPullTime say when.
+    An image in use, or used within this many days by Inspector's lastInUseAt, is protected, and so is one whose
+    platform image or single manifest ECR's lastRecordedPullTime says was pulled within this many days. A pull that
+    fetches only an image index, as a client that has the platform image cached may, isn't seen: an index's own pull
+    time doesn't count, as ECR records the job's own read of each index as a pull. Put a tag something pins in
+    retain_tags rather than rely on a recent pull.
   EOT
   type        = number
   default     = 2
