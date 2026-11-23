@@ -818,7 +818,7 @@ def test_an_attestations_pull_changes_nothing(coverage):
     ids=["a-second-before", "a-second-after"],
 )
 def test_an_image_pushed_before_ecr_recorded_pulls_is_unknown(offset, deleted):
-    # Pulled before ECR recorded pulls, it carries no record of that pull.
+    # Pushed before AWS released ECR's pull time, it may have been pulled without a record.
     repo = Repo()
     pushed = (NOW - selection.PULL_RECORD_START - offset) / timedelta(days=1)
     made = without_in_use_data(
@@ -975,6 +975,40 @@ def test_an_old_botocore_model_fails_the_run():
     ecr, _ = clients()
     with pytest.raises(cleanup.CleanupError, match="inUseCount"):
         cleanup.check_models(ecr, OldInspector)
+
+
+def test_an_ecr_model_without_the_pull_time_fails_the_run_before_any_call():
+    # A botocore that drops lastRecordedPullTime would make every image without Inspector's in-use data look never
+    # pulled.
+    real, inspector = clients()
+    model = real.meta.service_model
+
+    class Shape:
+        members = {
+            name: None
+            for name in model.shape_for("ImageDetail").members
+            if name != "lastRecordedPullTime"
+        }
+
+    class Model:
+        @staticmethod
+        def shape_for(name):
+            return Shape if name == "ImageDetail" else model.shape_for(name)
+
+    class Meta:
+        service_model = Model
+
+    class OldEcr:
+        meta = Meta
+
+        def __getattr__(self, name):
+            raise AssertionError(f"The run called ECR's {name}.")
+
+    # Inspector's Stubber has no answers: a call to Inspector fails the test too.
+    with Stubber(inspector), pytest.raises(
+        cleanup.CleanupError, match="lastRecordedPullTime"
+    ):
+        cleanup.run(settings(), OldEcr(), inspector, NOW)
 
 
 def test_the_installed_botocore_models_the_fields():
