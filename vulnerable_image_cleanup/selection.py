@@ -13,6 +13,10 @@ An image is protected, and kept, when any of these hold:
 * it isn't ACTIVE (archived images are outside the lifecycle's rules too);
 * the job can't tell whether it is in use.
 
+The job judges use from Inspector's in-use data and from ECR's pull record. A container runtime pulls an image to run
+it, and ECR records the pull on the manifest it fetched, so an image whose runnable manifests ECR never recorded a pull
+of was never run.
+
 An image index and the manifests it references are judged, and deleted, as one image: a "unit".
 """
 
@@ -22,7 +26,7 @@ import json
 import re
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import (
     Any,
     Deque,
@@ -58,6 +62,22 @@ IN_USE_UNKNOWN = "in_use_unknown"
 RECENT = "recent"
 NOT_ACTIVE = "not_active"
 REASONS = (RETAINED_TAG, ROLLBACK_CANDIDATE, IN_USE, IN_USE_UNKNOWN, RECENT, NOT_ACTIVE)
+
+# How a unit's use was judged, as its log line says.
+JUDGED_BY_INSPECTOR = "inspector"
+JUDGED_BY_PULL_RECORD = "ecr_pull_record"
+JUDGED_UNKNOWN = "unknown"
+
+# ECR has recorded an image's pulls (lastRecordedPullTime) since AWS's release of 2022-03-02, whose note in botocore
+# 1.24.11's changelog reads "This release adds support for tracking images lastRecordedPullTime". An image pushed
+# before then may have been pulled without a record. The next day, so the day of the release is covered.
+PULL_RECORD_START = datetime(2022, 3, 3, tzinfo=timezone.utc)
+
+# How one runnable manifest's use was judged.
+_BY_INSPECTOR = "inspector"
+_NEVER_PULLED = "never_pulled"
+_PULLED_WITHIN_SOAK = "pulled_within_soak"
+_UNKNOWN = "unknown"
 
 _IMAGE_ARN = re.compile(
     r"^arn:[^:]+:ecr:[^:]+:(?P<account>\d{12}):repository/(?P<repository>.+)/(?P<digest>sha256:[0-9a-f]{64})$"
@@ -445,7 +465,11 @@ class Verdict:
     :param reasons: Why it is protected; empty if nothing protects it.
     :param last_in_use_at: The latest ``lastInUseAt`` Inspector gave for its manifests.
     :param in_use_count: The highest ``inUseCount`` Inspector gave for its manifests.
-    :param last_pulled_at: The latest pull ECR recorded for its manifests.
+    :param last_pulled_at: The latest pull ECR recorded for its runnable manifests.
+    :param use_judged_by: How its use was judged: by Inspector, by ECR's pull record, or unknown. None if it has no
+        runnable manifest.
+    :param never_pulled: True if its use was judged from ECR's pull record, and ECR recorded no pull of any of its
+        runnable manifests.
     """
 
     unit: Unit
@@ -456,6 +480,8 @@ class Verdict:
     last_in_use_at: Optional[datetime]
     in_use_count: Optional[int]
     last_pulled_at: Optional[datetime]
+    use_judged_by: Optional[str]
+    never_pulled: bool
 
     @property
     def is_vulnerable(self) -> bool:
@@ -482,6 +508,8 @@ class Verdict:
             "last_in_use_at": _iso(self.last_in_use_at),
             "in_use_count": self.in_use_count,
             "last_pulled_at": _iso(self.last_pulled_at),
+            "use_judged_by": self.use_judged_by,
+            "never_pulled": self.never_pulled,
             "vulnerabilities": list(self.vulnerabilities),
         }
 
@@ -560,6 +588,7 @@ class Plan:
                 reason: sum(reason in verdict.reasons for verdict in vulnerable)
                 for reason in REASONS
             },
+            "judged_never_pulled": sum(verdict.never_pulled for verdict in vulnerable),
             "candidates": len(self.deletions) + len(self.left_by_cap),
             "deleted": 0 if settings.dry_run else len(self.deletions),
             "would_delete": len(self.deletions) if settings.dry_run else 0,
@@ -656,26 +685,30 @@ def judge(
                 in_use_counts.append(metadata["inUseCount"])
             if metadata.get("lastInUseAt") is not None:
                 last_uses.append(metadata["lastInUseAt"])
-    # An index's own pull time doesn't count: the job reads every index with BatchGetImage each run, and ECR records
-    # that read as a pull. A real pull of an index records its platform image's pull too, and the job never reads
-    # those, so their pull times still say when the image was last pulled.
+    # Only the pulls of what a container runs count: a platform image or a single manifest. An index's own pull time
+    # doesn't: the job reads every index with BatchGetImage each run, and ECR records that read as a pull. A real pull
+    # of an index records its platform image's pull too, and the job never reads those, so their pull times still say
+    # when the image was last pulled. An attestation's doesn't either: a runtime doesn't pull one to run the image.
+    runnable = [image for image in images if repository.is_runnable(image.digest)]
     pulls = [
-        image.last_pulled_at
-        for image in images
-        if image.last_pulled_at is not None
-        and image.digest not in repository.references
+        image.last_pulled_at for image in runnable if image.last_pulled_at is not None
     ]
     if any(count > 0 for count in in_use_counts) or any(
         moment >= soak_start for moment in last_uses + pulls
     ):
         reasons.add(IN_USE)
-    # Fail closed: every manifest a container could run needs a coverage record that says how it was used. Botocore
-    # drops a field its model doesn't know, and Inspector leaves both out for an image it hasn't seen in use.
-    for image in images:
-        if repository.is_runnable(image.digest) and not _usage_known(
-            evidence.coverage.get(image.digest, ())
-        ):
-            reasons.add(IN_USE_UNKNOWN)
+    # Fail closed: the use of every manifest a container could run must be judged, by Inspector or by ECR's pull
+    # record. A unit is unknown when any of them is.
+    uses = {_judge_use(image, evidence, soak_start) for image in runnable}
+    if _UNKNOWN in uses:
+        reasons.add(IN_USE_UNKNOWN)
+        use_judged_by: Optional[str] = JUDGED_UNKNOWN
+    elif uses & {_NEVER_PULLED, _PULLED_WITHIN_SOAK}:
+        use_judged_by = JUDGED_BY_PULL_RECORD
+    elif uses:
+        use_judged_by = JUDGED_BY_INSPECTOR
+    else:
+        use_judged_by = None
 
     vulnerabilities: Set[str] = set()
     for image in images:
@@ -690,6 +723,8 @@ def judge(
         last_in_use_at=max(last_uses, default=None),
         in_use_count=max(in_use_counts, default=None),
         last_pulled_at=max(pulls, default=None),
+        use_judged_by=use_judged_by,
+        never_pulled=use_judged_by == JUDGED_BY_PULL_RECORD and not pulls,
     )
 
 
@@ -766,6 +801,41 @@ def parse_manifest(text: str) -> Dict[str, Any]:
     if not isinstance(manifest, dict):
         raise RepositoryError("A manifest isn't a JSON object.")
     return manifest
+
+
+def _judge_use(image: Image, evidence: Evidence, soak_start: datetime) -> str:
+    """
+    How the use of one runnable manifest is judged.
+
+    :param image: A platform image or a single manifest.
+    :param evidence: What Inspector says.
+    :param soak_start: The start of the soak.
+    :return: By Inspector, never pulled, pulled within the soak, or unknown.
+    """
+    coverage = evidence.coverage.get(image.digest, ())
+    if _usage_known(coverage):
+        return _BY_INSPECTOR
+    # Some of Inspector's in-use data, without the rest, says something about use that ECR's pull record can't
+    # overrule: such an image is judged as before, unknown. Botocore drops a field its model doesn't know, too.
+    if any(
+        _has_usage(record)
+        for record in coverage + evidence.finding_usage.get(image.digest, ())
+    ):
+        return _UNKNOWN
+    if image.last_pulled_at is None:
+        # Never pulled, so never run: a runtime pulls an image to run it, and ECR records that pull on the manifest
+        # fetched. Unless it was pushed before ECR recorded pulls.
+        if image.pushed_at is not None and image.pushed_at >= PULL_RECORD_START:
+            return _NEVER_PULLED
+        return _UNKNOWN
+    if image.last_pulled_at >= soak_start:
+        return _PULLED_WITHIN_SOAK
+    # Pulled before the soak: a task that pulled it then may still run it, and nothing here can tell.
+    return _UNKNOWN
+
+
+def _has_usage(record: Mapping[str, Any]) -> bool:
+    return record.get("inUseCount") is not None or record.get("lastInUseAt") is not None
 
 
 def _usage_known(records: Sequence[Mapping[str, Any]]) -> bool:
