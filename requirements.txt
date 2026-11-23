@@ -1,5 +1,8 @@
 infrahouse-core ~= 0.23
 pytest-infrahouse ~= 0.24
+# The vulnerable image cleanup's unit tests stub ECR and Inspector with botocore's models: they need the fields
+# the function reads, which botocore models from 1.41 on (see vulnerable_image_cleanup/requirements.txt).
+boto3 ~= 1.41
 
 # Documentation dependencies
 diagrams ~= 0.25
