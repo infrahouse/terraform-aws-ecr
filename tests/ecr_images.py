@@ -318,6 +318,30 @@ def wait_for_pull_time(
         time.sleep(30)
 
 
+def wait_for_settled_pull_time(
+    ecr: Any, repository: str, digest: str, quiet: int, timeout: int
+) -> Optional[Any]:
+    """
+    Wait until ECR's answers agree on an image's pull time. For about five minutes after a first pull shows, they flap:
+    one read shows it, the next doesn't, and in the test account every read showed it for up to 70 s at a time before
+    one lost it again. So wait until every read, one every 2 s, has shown it for ``quiet`` seconds.
+
+    :return: The pull time, or None if the answers didn't settle within the timeout.
+    """
+    deadline = time.time() + timeout
+    shown_since = None
+    while time.time() < deadline:
+        moment = pull_times(ecr, repository).get(digest)
+        if moment is None:
+            shown_since = None
+        elif shown_since is None:
+            shown_since = time.time()
+        elif time.time() - shown_since >= quiet:
+            return moment
+        time.sleep(2)
+    return None
+
+
 def pull_times(ecr: Any, repository: str) -> Dict[str, Optional[Any]]:
     """
     :return: ECR's lastRecordedPullTime of every image in the repository, by digest; None for an image without one.
