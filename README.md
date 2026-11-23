@@ -27,15 +27,18 @@ candidate retention.
 ## Requirements
 
 - Terraform 1.9 or later
-- AWS provider 5.31 or later, below 7.0
+- AWS provider 6.0 or later, below 7.0
 - The `null` and `time` providers
 
 The vulnerable image cleanup runs as
 [terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored),
-which needs this floor. Terraform installs a module's providers whether
-the module is used or not, so the floor applies to every caller, with
-the cleanup on or off. Earlier releases of this module needed Terraform
-1.5 and AWS provider 5.11.
+which needs this floor: its S3 bucket comes from
+[terraform-aws-s3-bucket](https://github.com/infrahouse/terraform-aws-s3-bucket),
+which needs AWS provider 6.0. Terraform installs a module's providers
+whether the module is used or not, so the floor applies to every caller,
+with the cleanup on or off: a caller on AWS provider 5 upgrades to 6
+before taking this release. Earlier releases of this module needed
+Terraform 1.5 and AWS provider 5.11.
 
 ## Quick Start
 
@@ -328,7 +331,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | Name | Version |
 |------|---------|
 | <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | ~> 1.9 |
-| <a name="requirement_aws"></a> [aws](#requirement\_aws) | >= 5.31, < 7.0 |
+| <a name="requirement_aws"></a> [aws](#requirement\_aws) | >= 6.0, < 7.0 |
 | <a name="requirement_null"></a> [null](#requirement\_null) | ~> 3.0 |
 | <a name="requirement_time"></a> [time](#requirement\_time) | ~> 0.9 |
 
@@ -336,7 +339,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 | Name | Version |
 |------|---------|
-| <a name="provider_aws"></a> [aws](#provider\_aws) | >= 5.31, < 7.0 |
+| <a name="provider_aws"></a> [aws](#provider\_aws) | >= 6.0, < 7.0 |
 
 ## Modules
 

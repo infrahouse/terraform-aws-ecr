@@ -2,11 +2,12 @@
 
 Module that creates a container registry (AWS ECR service).
 
-It needs Terraform 1.9 or later, AWS provider 5.31 or later (below 7.0), and the `null` and `time` providers.
+It needs Terraform 1.9 or later, AWS provider 6.0 or later (below 7.0), and the `null` and `time` providers.
 The vulnerable image cleanup below runs as
 [terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored), which needs this
-floor, and Terraform installs a module's providers whether the module is used or not: the floor applies to every
-caller, with the cleanup on or off.
+floor (its S3 bucket comes from terraform-aws-s3-bucket, which needs AWS provider 6.0), and Terraform installs a
+module's providers whether the module is used or not: the floor applies to every caller, with the cleanup on or off.
+A caller on AWS provider 5 upgrades to 6 before taking this release.
 
 ## Vulnerable image cleanup
 
