@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Sequence
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 
 import selection
 from selection import Evidence, Plan, Repository, Settings
@@ -45,6 +46,19 @@ REQUIRED_MODEL_FIELDS = {
 
 class CleanupError(RuntimeError):
     """The run can't go on safely."""
+
+
+class DeletionError(CleanupError):
+    """
+    A deletion that failed part way.
+
+    :param message: What failed.
+    :param deleted: The digests ECR deleted before it failed.
+    """
+
+    def __init__(self, message: str, deleted: Sequence[str]) -> None:
+        super().__init__(message)
+        self.deleted = list(deleted)
 
 
 def lambda_handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
@@ -226,21 +240,33 @@ def execute(settings: Settings, ecr: Any, plan: Plan) -> Dict[str, Any]:
     :param ecr: An ECR client.
     :param plan: The plan.
     :return: The run's summary.
-    :raise CleanupError: if ECR refuses a deletion.
+    :raise DeletionError: if a deletion fails. A ``delete_failed`` line names the image and the digests ECR deleted
+        before the failure, as a deletion can't be undone.
     """
     for verdict in plan.kept_vulnerable:
         _log(
             "kept", settings, dict(verdict.describe(), reasons=sorted(verdict.reasons))
         )
     for deletion in plan.deletions:
-        if not settings.dry_run:
+        if settings.dry_run:
+            _log("would_delete", settings, deletion.describe())
+            continue
+        deleted: List[str] = []
+        try:
             for batch in deletion.batches:
-                delete_images(settings, ecr, batch)
-        _log(
-            "would_delete" if settings.dry_run else "deleted",
-            settings,
-            deletion.describe(),
-        )
+                deleted.extend(delete_images(settings, ecr, batch))
+        except DeletionError as error:
+            _log(
+                "delete_failed",
+                settings,
+                dict(
+                    deletion.describe(),
+                    deleted_digests=deleted + error.deleted,
+                    error=str(error),
+                ),
+            )
+            raise
+        _log("deleted", settings, deletion.describe())
     for verdict in plan.left_by_cap:
         _log("left_by_cap", settings, verdict.describe())
     summary = plan.summary(settings)
@@ -248,28 +274,39 @@ def execute(settings: Settings, ecr: Any, plan: Plan) -> Dict[str, Any]:
     return summary
 
 
-def delete_images(settings: Settings, ecr: Any, digests: Sequence[str]) -> None:
+def delete_images(settings: Settings, ecr: Any, digests: Sequence[str]) -> List[str]:
     """
     Delete images by digest. An image already gone counts as deleted.
 
     :param settings: The job's settings.
     :param ecr: An ECR client.
     :param digests: The digests.
-    :raise CleanupError: if ECR refuses to delete one, e.g. ImageReferencedByManifestList.
+    :return: The digests ECR deleted, as its answers name them.
+    :raise DeletionError: if ECR refuses to delete one, e.g. ImageReferencedByManifestList, or a call fails. It holds
+        the digests ECR deleted before: BatchDeleteImage deletes the rest of a batch when it refuses some.
     """
+    deleted: List[str] = []
     for chunk in _chunks(digests, BATCH_SIZE):
-        response = ecr.batch_delete_image(
-            registryId=settings.registry_id,
-            repositoryName=settings.repository_name,
-            imageIds=[{"imageDigest": digest} for digest in chunk],
-        )
+        try:
+            response = ecr.batch_delete_image(
+                registryId=settings.registry_id,
+                repositoryName=settings.repository_name,
+                imageIds=[{"imageDigest": digest} for digest in chunk],
+            )
+        except (BotoCoreError, ClientError) as error:
+            raise DeletionError(f"BatchDeleteImage failed: {error}", deleted) from error
+        for image_id in response.get("imageIds", []):
+            digest = image_id.get("imageDigest")
+            if digest is not None and digest not in deleted:
+                deleted.append(digest)
         refused = [
             failure
             for failure in response.get("failures", [])
             if failure.get("failureCode") != "ImageNotFound"
         ]
         if refused:
-            raise CleanupError(f"ECR refused to delete: {refused}")
+            raise DeletionError(f"ECR refused to delete: {refused}", deleted)
+    return deleted
 
 
 def _chunks(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
