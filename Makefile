@@ -70,7 +70,7 @@ fmt: format
 format:  ## Use terraform fmt to format all files in the repo
 	@echo "Formatting terraform files"
 	terraform fmt -recursive
-	black tests
+	black tests vulnerable_image_cleanup
 
 define BROWSER_PYSCRIPT
 import os, webbrowser, sys
@@ -92,7 +92,7 @@ docs: ## generate Sphinx HTML documentation, including API docs
 .PHONY: lint
 lint:  ## Lint the module
 	@echo "Check code style"
-	black --check tests
+	black --check tests vulnerable_image_cleanup
 	terraform fmt -check -recursive
 
 # Internal function to handle version release
