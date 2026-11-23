@@ -258,28 +258,55 @@ An image is protected, and kept, when any of these hold:
   `vulnerable_image_cleanup_soak_days` (default 2, `lastInUseAt`). Or
   ECR recorded a pull of its platform image, or of a single-manifest
   image, within the soak (`lastRecordedPullTime`).
-
-  Which pulls count: a fetch of a platform image or a single manifest.
-  An index's own pull time doesn't count: the job reads every index each
-  run, and ECR records that read as a pull. So a pull that fetches only
-  the index isn't seen. A fresh `docker pull` fetches the platform image
-  too, but a client that already has it, such as an EKS node or a host
-  that ran the image before, may fetch only the index, and then only
-  Inspector's in-use data protects the image. Put every tag something
-  pins in `retain_tags` rather than rely on a recent pull.
 - It was pushed within `vulnerable_image_cleanup_min_age_days` (default
   7), so an image waiting for its pin isn't deleted.
 - It isn't ACTIVE: an archived image.
-- The job can't tell whether it is in use: a platform image without an
-  Inspector coverage record, or whose record lacks `inUseCount` or
-  `lastInUseAt`. Inspector leaves both out for an image it has never seen
-  in use, so the cleanup keeps such an image, and the lifecycle policy
-  remains what removes it.
+- The job can't tell whether it is in use. That is a platform image, or
+  a single-manifest image, that Inspector gives no in-use data on and
+  that ECR recorded a pull of before the soak: a long-running task that
+  pulled it then may still run it. Or one that Inspector gives only part
+  of its in-use data on. Or one pushed before 2022-03-03, when ECR began
+  recording pulls, which may have been pulled without a record.
 
 A reason that holds for any manifest of an index protects the whole
 index, and an index that is kept keeps every manifest it references:
 when two indexes share a platform image and one is kept, the other is
 deleted and the shared image stays.
+
+### How it judges use
+
+From Inspector's in-use data, `inUseCount` and `lastInUseAt`, when
+Inspector gives it. Inspector leaves both out for an image it has never
+seen in use, and some accounts get them for no image at all.
+
+Otherwise from ECR's pull record. A container runtime pulls an image to
+run it, and ECR records the pull on the platform image it fetched. So an
+image none of whose platform images ECR ever recorded a pull of (or, for
+a single-manifest image, the manifest) was never run: the job judges it
+not in use, and deletes it if nothing else protects it. Inspector's
+scans record no pull, and the job's own reads record one on the indexes
+only.
+
+Which pulls count: a fetch of a platform image or a single manifest.
+An index's own pull time doesn't count: the job reads every index each
+run, and ECR records that read as a pull. An attestation's doesn't
+either: a runtime doesn't fetch one to run the image. A client that
+already has the platform image, such as an EKS node or a host that ran
+the image before, may fetch only the index; the pull that brought the
+platform image to it is on record, and keeps the image.
+
+What ECR's pull record doesn't show, so put every tag something pins in
+`retain_tags` rather than rely on a pull:
+
+- A first pull within the last day. ECR refreshes the pull time "at
+  least once every 24 hours", so an old image deployed for the first
+  time within the last day, say for a rollback, may not show its pull
+  yet.
+- A pull from elsewhere. ECR records a pull on the image in the
+  repository that served it: a replica in another Region or account, or
+  the same image pulled from another repository and cached on a host,
+  runs without a pull recorded here.
+- A pull by a principal in the registry's pull-time update exclusions.
 
 When the job can't judge, it deletes nothing: an API error, throttling
 that outlasts the retries, or a page or manifest it can't read fails the
@@ -293,11 +320,14 @@ its role has no `ecr:BatchDeleteImage` at all. Each run logs, as JSON:
 
 - one line per image deleted, or that would be (`"action": "deleted"` or
   `"would_delete"`), with its digests, tags, push time, last use and
-  pull, and the CVE ids;
-- one line per vulnerable image kept, with its `reasons`, and one per
-  image the cap leaves for a later run (`"left_by_cap"`);
+  pull, how its use was judged (`use_judged_by`: `inspector`,
+  `ecr_pull_record` or `unknown`; and `never_pulled`), and the CVE ids;
+- one line per vulnerable image kept, with the same facts and its
+  `reasons`, and one per image the cap leaves for a later run
+  (`"left_by_cap"`);
 - one summary line: images seen, vulnerable, protected by each reason,
-  deleted, and left by the cap.
+  vulnerable images judged never pulled (`judged_never_pulled`), deleted,
+  and left by the cap.
 
 If a deletion fails part way, say ECR refuses a manifest or throttles
 past the retries, the run logs one `"delete_failed"` line naming the
@@ -393,13 +423,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | <a name="input_tag_prefix_list"></a> [tag\_prefix\_list](#input\_tag\_prefix\_list) | List of tag prefixes for tagged image lifecycle rules.<br/>Only tagged images whose tag starts with one of these prefixes<br/>will be expired, e.g. ["v", "release-"] matches "v1.0", "release-2026".<br/>At least one of tag\_pattern\_list or tag\_prefix\_list is required<br/>when expire\_days\_tagged or expire\_count\_tagged is set. | `list(string)` | `null` | no |
 | <a name="input_vulnerable_image_cleanup_alarm_emails"></a> [vulnerable\_image\_cleanup\_alarm\_emails](#input\_vulnerable\_image\_cleanup\_alarm\_emails) | Email addresses that get the cleanup Lambda's alarms, through terraform-aws-lambda-monitored. Required<br/>when the cleanup is on: a failed run alarms. AWS sends each address a confirmation email to accept. | `list(string)` | `[]` | no |
 | <a name="input_vulnerable_image_cleanup_dry_run"></a> [vulnerable\_image\_cleanup\_dry\_run](#input\_vulnerable\_image\_cleanup\_dry\_run) | The cleanup only logs what it would delete, and its role has no ecr:BatchDeleteImage. Set to false to<br/>delete: a deletion can't be undone. | `bool` | `true` | no |
-| <a name="input_vulnerable_image_cleanup_enabled"></a> [vulnerable\_image\_cleanup\_enabled](#input\_vulnerable\_image\_cleanup\_enabled) | Turns on the vulnerable image cleanup: a scheduled Lambda that deletes the images Amazon Inspector<br/>reports vulnerable, at or above vulnerable\_image\_cleanup\_min\_severity with a fix available, that nothing<br/>protects. An image is protected when it carries a tag in retain\_tags, is a rollback candidate the<br/>lifecycle policy keeps, is in use or was within the soak, was pushed within the least age, or when the<br/>job can't tell whether it is in use. An image index is deleted with the manifests it references.<br/>Turned on, it runs dry until vulnerable\_image\_cleanup\_dry\_run is false. A deletion can't be undone.<br/>Off by default: false creates nothing. | `bool` | `false` | no |
+| <a name="input_vulnerable_image_cleanup_enabled"></a> [vulnerable\_image\_cleanup\_enabled](#input\_vulnerable\_image\_cleanup\_enabled) | Turns on the vulnerable image cleanup: a scheduled Lambda that deletes the images Amazon Inspector<br/>reports vulnerable, at or above vulnerable\_image\_cleanup\_min\_severity with a fix available, that nothing<br/>protects. An image is protected when it carries a tag in retain\_tags, is a rollback candidate the<br/>lifecycle policy keeps, is in use or was within the soak, was pushed within the least age, or when the<br/>job can't tell whether it is in use. It judges use from Inspector's in-use data and from ECR's pull<br/>record: an image whose platform images ECR never recorded a pull of was never run, so it isn't in use.<br/>ECR refreshes the pull time at least once every 24 hours, and records a pull only in the repository that<br/>served it: put every tag something pins in retain\_tags. An image index is deleted with the manifests it<br/>references.<br/>Turned on, it runs dry until vulnerable\_image\_cleanup\_dry\_run is false. A deletion can't be undone.<br/>Off by default: false creates nothing. | `bool` | `false` | no |
 | <a name="input_vulnerable_image_cleanup_max_deletions"></a> [vulnerable\_image\_cleanup\_max\_deletions](#input\_vulnerable\_image\_cleanup\_max\_deletions) | The most images the cleanup deletes in a run. An image index with the manifests it references counts as<br/>one image. The oldest go first; the rest wait for the next run. | `number` | `10` | no |
 | <a name="input_vulnerable_image_cleanup_min_age_days"></a> [vulnerable\_image\_cleanup\_min\_age\_days](#input\_vulnerable\_image\_cleanup\_min\_age\_days) | An image pushed within this many days is protected, so an image waiting for its pin isn't deleted. | `number` | `7` | no |
 | <a name="input_vulnerable_image_cleanup_min_severity"></a> [vulnerable\_image\_cleanup\_min\_severity](#input\_vulnerable\_image\_cleanup\_min\_severity) | The least Inspector severity that makes an image vulnerable: CRITICAL, HIGH, MEDIUM or LOW. Only ACTIVE<br/>findings with a fix available count. | `string` | `"HIGH"` | no |
 | <a name="input_vulnerable_image_cleanup_protect_rollback_candidates"></a> [vulnerable\_image\_cleanup\_protect\_rollback\_candidates](#input\_vulnerable\_image\_cleanup\_protect\_rollback\_candidates) | Protects the rollback candidates the lifecycle policy keeps (rollback\_candidate\_retain\_count and<br/>rollback\_candidate\_retain\_days) even when they are vulnerable, so a rollback can go to them until they<br/>rotate out. Set to false to delete a vulnerable rollback candidate once nothing else protects it, so a<br/>rollback can only go to an image without such findings. | `bool` | `true` | no |
 | <a name="input_vulnerable_image_cleanup_schedule"></a> [vulnerable\_image\_cleanup\_schedule](#input\_vulnerable\_image\_cleanup\_schedule) | When the cleanup runs: an EventBridge schedule expression, rate(...) or cron(...).<br/>See https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html | `string` | `"rate(1 day)"` | no |
-| <a name="input_vulnerable_image_cleanup_soak_days"></a> [vulnerable\_image\_cleanup\_soak\_days](#input\_vulnerable\_image\_cleanup\_soak\_days) | An image in use, or used within this many days by Inspector's lastInUseAt, is protected, and so is one whose<br/>platform image or single manifest ECR's lastRecordedPullTime says was pulled within this many days. A pull that<br/>fetches only an image index, as a client that has the platform image cached may, isn't seen: an index's own pull<br/>time doesn't count, as ECR records the job's own read of each index as a pull. Put a tag something pins in<br/>retain\_tags rather than rely on a recent pull. | `number` | `2` | no |
+| <a name="input_vulnerable_image_cleanup_soak_days"></a> [vulnerable\_image\_cleanup\_soak\_days](#input\_vulnerable\_image\_cleanup\_soak\_days) | An image in use, or used within this many days by Inspector's lastInUseAt, is protected, and so is one whose<br/>platform image or single manifest ECR's lastRecordedPullTime says was pulled within this many days. Without<br/>Inspector's in-use data, one pulled earlier is kept too, as a task that pulled it then may still run it,<br/>while one never pulled was never run, and isn't in use. An index's own pull time doesn't count, as ECR records<br/>the job's own read of each index as a pull. ECR refreshes the pull time at least once every 24 hours, so a first<br/>pull within the last day may not show yet: put a tag something pins in retain\_tags rather than rely on a pull. | `number` | `2` | no |
 
 ## Outputs
 
