@@ -40,7 +40,10 @@ from tests.ecr_images import (
 
 REPOSITORY = "test-cleanup-e2e"
 # Debian 12 as of 2023-06-12, linux/amd64: Inspector reports HIGH and CRITICAL findings with fixes in it.
-VULNERABLE_BASE = "public.ecr.aws/docker/library/debian@sha256:439cd0f6828e5930c3faec89e42e2ec06a1395a03fa459a36095f6c595c1e64d"
+VULNERABLE_BASE = (
+    "public.ecr.aws/docker/library/debian"
+    "@sha256:439cd0f6828e5930c3faec89e42e2ec06a1395a03fa459a36095f6c595c1e64d"
+)
 
 
 def index_contents(ecr, digest):
