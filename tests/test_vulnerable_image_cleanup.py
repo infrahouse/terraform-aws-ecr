@@ -251,16 +251,29 @@ class Repo:
         self,
         deletions: Iterable[Sequence[str]] = (),
         refused: Optional[Dict[str, str]] = None,
+        throttled: Optional[int] = None,
         **overrides: Any,
     ) -> Dict[str, Any]:
         """
         Run the cleanup. ``deletions`` are the BatchDeleteImage calls the run must make, in order; any other delete
-        fails the test.
+        fails the test. ECR refuses the images in ``refused`` with their failure codes, and the call numbered
+        ``throttled`` (from 0) fails with ThrottlingException.
         """
         ecr, inspector = clients()
         with Stubber(ecr) as ecr_stub, Stubber(inspector) as inspector_stub:
             self.stub_reads(ecr_stub, inspector_stub)
-            for batch in deletions:
+            for number, batch in enumerate(deletions):
+                if number == throttled:
+                    ecr_stub.add_client_error(
+                        "batch_delete_image",
+                        service_error_code="ThrottlingException",
+                        expected_params={
+                            "registryId": REGISTRY,
+                            "repositoryName": REPOSITORY,
+                            "imageIds": [{"imageDigest": image} for image in batch],
+                        },
+                    )
+                    continue
                 failures = [
                     {
                         "imageId": {"imageDigest": image},
@@ -725,6 +738,50 @@ def test_a_refused_deletion_fails_the_run():
             deletions=deletes(made)[:2],
             refused={made["platform"]: "ImageReferencedByManifestList"},
         )
+
+
+def logged(caplog: pytest.LogCaptureFixture) -> List[Dict[str, Any]]:
+    """The run's JSON log lines."""
+    return [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.getMessage().startswith("{")
+    ]
+
+
+def test_a_refused_child_logs_the_index_ecr_deleted(caplog):
+    repo = Repo()
+    made = vulnerable_index(repo, "old", tags=["abc"])
+    with caplog.at_level("INFO"), pytest.raises(
+        cleanup.DeletionError, match="ImageReferencedByManifestList"
+    ):
+        repo.run(
+            deletions=deletes(made),
+            refused={made["platform"]: "ImageReferencedByManifestList"},
+        )
+    (line,) = logged(caplog)
+    assert line["action"] == "delete_failed"
+    assert line["digests"] == [made["index"], made["platform"], made["attestation"]]
+    # ECR deleted the index, and the attestation in the batch it refused the platform image of.
+    assert line["deleted_digests"] == [made["index"], made["attestation"]]
+    assert "ImageReferencedByManifestList" in line["error"]
+    assert line["tags"] == ["abc"]
+
+
+def test_a_failed_call_logs_what_ecr_deleted_before(caplog):
+    repo = Repo()
+    first = vulnerable_index(repo, "first", tags=["first"], pushed=40)
+    second = vulnerable_index(repo, "second", tags=["second"])
+    with caplog.at_level("INFO"), pytest.raises(
+        cleanup.DeletionError, match="ThrottlingException"
+    ):
+        repo.run(deletions=deletes(first) + deletes(second), throttled=3)
+    deleted, failed = logged(caplog)
+    assert deleted["action"] == "deleted"
+    assert deleted["tags"] == ["first"]
+    assert failed["action"] == "delete_failed"
+    assert failed["tags"] == ["second"]
+    assert failed["deleted_digests"] == [second["index"]]
 
 
 def test_an_image_already_gone_counts_as_deleted():
