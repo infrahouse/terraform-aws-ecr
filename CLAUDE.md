@@ -73,12 +73,21 @@ The rules, which must stay right:
   keeping), while `vulnerable_image_cleanup_protect_rollback_candidates`;
   in use (`inUseCount` > 0, or `lastInUseAt` or ECR's
   `lastRecordedPullTime` of a platform image or single manifest within
-  the soak; an index's own pull time doesn't count, as ECR records the
-  job's BatchGetImage of it as a pull, so a pull that fetches only the
-  index, e.g. by a client with the platform image cached, isn't seen,
-  and only Inspector's in-use data or `retain_tags` protect it); pushed
-  within the least age;
-  not ACTIVE; in-use data missing for a platform image.
+  the soak); pushed within the least age; not ACTIVE; use unknown.
+- Use is judged per runnable manifest (a platform image or single
+  manifest; never an index's own pull time, as ECR records the job's
+  BatchGetImage of an index as a pull, nor an attestation's):
+  Inspector's in-use data, both fields, judged as before; part of it,
+  unknown; none (no coverage record, or neither field): ECR's pull
+  record. Never pulled means never run, so not in use (`never_pulled`);
+  pulled within the soak, in use; pulled before it, unknown, as a
+  long-running task may still run it. Pushed before `PULL_RECORD_START`
+  (2022-03-03; AWS's release note of 2022-03-02 in botocore 1.24.11's
+  changelog) and never pulled: unknown. A unit is unknown when any of
+  its runnable manifests is. A shared manifest has one pull record,
+  which counts for every index. ECR refreshes the pull time at least
+  daily and records a pull only in the repository that served it: the
+  docs tell callers to put pinned tags in `retain_tags`.
 - Fail closed: any API error, failed page or unreadable manifest raises
   before a deletion. ECR's `ImageReferencedByManifestList` or any other
   refusal (but `ImageNotFound`) fails the run, after a `delete_failed`
@@ -133,11 +142,15 @@ The vulnerable image cleanup's tests:
   such as a delete in a dry run.
 - `tests/test_vulnerable_image_cleanup_dry_run.py`
   (`test_data/vulnerable_image_cleanup_dry_run/`): on and dry, a
-  repository with nothing vulnerable; reads the role's policies.
+  repository with nothing vulnerable; reads the role's policies, and
+  checks the function's reads record a pull of the indexes only.
 - `tests/test_vulnerable_image_cleanup_e2e.py`
   (`test_data/vulnerable_image_cleanup_e2e/`): needs `docker buildx`;
-  pushes images from an old Debian base, waits for Inspector, and checks
-  ECR's refusal, the deployed function, and deletion.
+  pushes images from an old Debian base, pulls one with `docker pull`,
+  waits for Inspector and ECR's pull record, and checks ECR's refusal,
+  the deployed function, that neither the reads nor Inspector's scans
+  record a pull of a platform image, and deletion, reading Inspector's
+  real coverage with the function's code.
 - `tests/test_module.py` checks the cleanup creates nothing when off.
 - `tests/ecr_images.py`: helpers that push images.
 
