@@ -1,6 +1,7 @@
 import json
 from os import path as osp, remove
 from shutil import rmtree
+from subprocess import check_output
 from textwrap import dedent
 
 import pytest
@@ -91,3 +92,26 @@ def test_module(
             (6, "Keep tagged images not older than 365 days."),
             (7, "Keep not more than 5 untagged images."),
         ]
+        # The vulnerable image cleanup is off by default: no function, role, policy or schedule.
+        assert (
+            tf_output.get("vulnerable_image_cleanup_function_name", {}).get("value")
+            is None
+        )
+        state = check_output(
+            ["terraform", "state", "list"], cwd=terraform_dir, text=True
+        ).split()
+        LOG.info("State: %s", state)
+        assert [
+            address for address in state if "vulnerable_image_cleanup" in address
+        ] == []
+        assert [
+            address
+            for address in state
+            if address.split(".")[-2]
+            in (
+                "aws_lambda_function",
+                "aws_iam_role",
+                "aws_iam_policy",
+                "aws_cloudwatch_event_rule",
+            )
+        ] == []
