@@ -7,7 +7,7 @@ shares the retained image's platform image.
 
 1. ECR refuses to delete a manifest an index references.
 2. The deployed function, with deletion on, deletes nothing: the images are new, and Inspector has no in-use data for
-   an image it never saw in use, so they are protected. Its read of each index is recorded as a pull of the index.
+   an image it never saw in use, so they are protected. ECR records each read of an index as a pull of the index.
 3. The function's code, from the test, with the least age at 0 and coverage that says the images were last in use 30
    days ago, deletes the unprotected images in order, and keeps the retained one and the manifest it shares.
 
@@ -154,11 +154,12 @@ def test_end_to_end(
         assert payload["deleted"] == 0
         assert list_digests(ecr, REPOSITORY) == before
 
-        # ECR records the function's BatchGetImage of an index as a pull of the index, minutes later. Step 3 shows
-        # that pull time doesn't protect the index: the platform images, which nothing read, carry none.
+        # ECR records a BatchGetImage of an index, the test's own above as the function's, as a pull of the index,
+        # some time later. Step 3 shows that pull time doesn't protect the index: the platform images, which nothing
+        # read, carry none.
         pulled = wait_for_pull_time(ecr, REPOSITORY, candidate["index"], timeout=1200)
         LOG.info(
-            "ECR's pull time on the candidate index after the function read it: %s",
+            "ECR's pull time on the candidate index, which only BatchGetImage read: %s",
             pulled,
         )
         if pulled is None:
