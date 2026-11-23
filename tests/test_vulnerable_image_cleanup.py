@@ -106,10 +106,13 @@ class Repo:
         platforms: Sequence[str] = (),
         status: str = "ACTIVE",
         media_type: Optional[str] = OCI_INDEX,
+        platform_pulled: Optional[float] = None,
+        attestation_pulled: Optional[float] = None,
     ) -> Dict[str, str]:
         """
         Add an index as BuildKit pushes it: a platform image, and an attestation. ``platforms`` names manifests
-        already in the repository that it references instead of its own platform image.
+        already in the repository that it references instead of its own platform image. ``pulled`` is the index's own
+        pull time; ``platform_pulled`` and ``attestation_pulled`` are those of its platform image and attestation.
         """
         entries = []
         made = {}
@@ -120,7 +123,10 @@ class Repo:
             ]
         else:
             made["platform"] = self.manifest(
-                f"{name}/platform", pushed=pushed, status=status
+                f"{name}/platform",
+                pushed=pushed,
+                pulled=platform_pulled,
+                status=status,
             )
             entries.append(
                 {"mediaType": OCI_MANIFEST, "digest": made["platform"], "size": 1}
@@ -129,6 +135,7 @@ class Repo:
             made["attestation"] = self.manifest(
                 f"{name}/attestation",
                 pushed=pushed,
+                pulled=attestation_pulled,
                 artifact=selection.ATTESTATION_ARTIFACT_MEDIA_TYPE,
                 status=status,
             )
@@ -468,10 +475,7 @@ def test_a_finding_that_says_in_use_protects():
 def test_a_pull_within_the_soak_protects():
     # A real pull of an index records its platform image's pull.
     repo = Repo()
-    made = vulnerable_index(repo, "pulled", tags=["abc"], pulled=1)
-    for detail in repo.details:
-        if detail["imageDigest"] == made["platform"]:
-            detail["lastRecordedPullTime"] = days_ago(1)
+    vulnerable_index(repo, "pulled", tags=["abc"], pulled=1, platform_pulled=1)
     summary = repo.run()
     assert summary["protected"]["in_use"] == 1
 
@@ -494,8 +498,9 @@ def test_the_pull_time_of_an_index_alone_does_not_count():
 
 
 def test_a_pull_before_the_soak_does_not_protect():
+    # Inspector says it isn't in use, so a pull before the soak doesn't protect it.
     repo = Repo()
-    made = vulnerable_index(repo, "pulled", tags=["abc"], pulled=3)
+    made = vulnerable_index(repo, "pulled", tags=["abc"], pulled=3, platform_pulled=3)
     assert repo.run(deletions=deletes(made))["deleted"] == 1
 
 
@@ -626,46 +631,203 @@ def test_rollback_count_keeps_ties_at_the_edge():
 # --- Fail closed ---
 
 
-def test_coverage_without_in_use_fields_keeps_the_image():
-    # What an image's record looks like to a botocore whose model lacks the fields, and what Inspector gives for an
-    # image it never saw in use.
-    repo = Repo()
-    made = repo.index("old", tags=["abc"])
-    repo.vulnerable(made["platform"])
-    repo.covered(made["platform"], in_use_count=None, last_in_use=None)
-    summary = repo.run()
-    assert summary["deleted"] == 0
-    assert summary["protected"]["in_use_unknown"] == 1
-
-
 @pytest.mark.parametrize("in_use_count, last_in_use", [(0, None), (None, 30)])
 def test_coverage_with_one_in_use_field_keeps_the_image(in_use_count, last_in_use):
+    # Some of Inspector's in-use data is judged as Inspector's, not as none: ECR's pull record doesn't make up for
+    # what it leaves out, though the image was never pulled.
     repo = Repo()
     made = repo.index("old", tags=["abc"])
     repo.vulnerable(made["platform"])
     repo.covered(made["platform"], in_use_count=in_use_count, last_in_use=last_in_use)
-    assert repo.run()["protected"]["in_use_unknown"] == 1
+    summary = repo.run()
+    assert summary["protected"]["in_use_unknown"] == 1
+    assert summary["judged_never_pulled"] == 0
 
 
-def test_no_coverage_record_keeps_the_image():
+def test_in_use_data_on_a_finding_alone_keeps_the_image():
     repo = Repo()
     made = repo.index("old", tags=["abc"])
-    repo.vulnerable(made["platform"])
+    repo.vulnerable(made["platform"], in_use_count=0, last_in_use=30)
     summary = repo.run()
-    assert summary["deleted"] == 0
     assert summary["protected"]["in_use_unknown"] == 1
+    assert summary["judged_never_pulled"] == 0
 
 
-def test_every_platform_image_needs_in_use_data():
-    repo = Repo()
-    arm = repo.manifest("multi/arm64")
+def multi_platform(repo: Repo, arm_pulled: Optional[float] = None) -> List[str]:
+    """
+    An index of two platform images. Inspector reports the amd64 one vulnerable and says it isn't in use; it gives
+    nothing on the arm64 one.
+
+    :return: The digests of the index, the amd64 image and the arm64 image.
+    """
+    arm = repo.manifest("multi/arm64", pulled=arm_pulled)
     amd = repo.manifest("multi/amd64")
-    repo.manifests[
-        repo.manifest("multi", tags=["abc"], media_type=OCI_INDEX, artifact=None)
-    ] = json.dumps({"manifests": [{"digest": amd}, {"digest": arm}]})
+    index = repo.manifest("multi", tags=["abc"], media_type=OCI_INDEX, artifact=None)
+    repo.manifests[index] = json.dumps(
+        {"manifests": [{"digest": amd}, {"digest": arm}]}
+    )
     repo.vulnerable(amd)
     repo.unused(amd)
+    return [index, amd, arm]
+
+
+def test_every_platform_image_needs_its_use_judged():
+    # A task pulled the arm64 image a month ago and may still run it.
+    repo = Repo()
+    multi_platform(repo, arm_pulled=30)
     assert repo.run()["protected"]["in_use_unknown"] == 1
+
+
+def test_platform_images_judged_by_inspector_and_by_ecr_pull_record(caplog):
+    repo = Repo()
+    index, amd, arm = multi_platform(repo)
+    with caplog.at_level("INFO"):
+        summary = repo.run(deletions=[[index], [amd, arm]])
+    assert summary["deleted"] == 1
+    line, _ = logged(caplog)
+    assert line["use_judged_by"] == "ecr_pull_record"
+    assert line["never_pulled"] is True
+
+
+# --- Without Inspector's in-use data: ECR's pull record ---
+
+# What Inspector gives for every image in InfraHouse's accounts: no coverage record, or one without inUseCount and
+# lastInUseAt. The latter is also what a record looks like to a botocore whose model lacks the fields.
+NO_IN_USE_DATA = ["no-coverage-record", "record-without-in-use-data"]
+
+
+def without_in_use_data(
+    repo: Repo, name: str, coverage: str, **kwargs: Any
+) -> Dict[str, str]:
+    """An index whose platform image Inspector reports vulnerable, and gives no in-use data on."""
+    made = repo.index(name, **kwargs)
+    platform = made.get("platform") or kwargs["platforms"][0]
+    repo.vulnerable(platform)
+    if coverage == "record-without-in-use-data":
+        repo.covered(platform, in_use_count=None, last_in_use=None)
+    return made
+
+
+@pytest.mark.parametrize("coverage", NO_IN_USE_DATA)
+def test_never_pulled_is_not_in_use(coverage, caplog):
+    repo = Repo()
+    made = without_in_use_data(repo, "old", coverage, tags=["abc"])
+    with caplog.at_level("INFO"):
+        summary = repo.run(deletions=deletes(made))
+    assert summary["deleted"] == 1
+    assert summary["protected"] == dict.fromkeys(selection.REASONS, 0)
+    assert summary["judged_never_pulled"] == 1
+    line, _ = logged(caplog)
+    assert line["action"] == "deleted"
+    assert line["use_judged_by"] == "ecr_pull_record"
+    assert line["never_pulled"] is True
+    assert line["last_pulled_at"] is None
+
+
+@pytest.mark.parametrize("coverage", NO_IN_USE_DATA)
+def test_pulled_within_the_soak_is_in_use(coverage, caplog):
+    repo = Repo()
+    without_in_use_data(repo, "running", coverage, tags=["abc"], platform_pulled=1)
+    with caplog.at_level("INFO"):
+        summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["protected"]["in_use"] == 1
+    assert summary["protected"]["in_use_unknown"] == 0
+    assert summary["judged_never_pulled"] == 0
+    line, _ = logged(caplog)
+    assert line["action"] == "kept"
+    assert line["reasons"] == ["in_use"]
+    assert line["use_judged_by"] == "ecr_pull_record"
+    assert line["never_pulled"] is False
+
+
+@pytest.mark.parametrize("coverage", NO_IN_USE_DATA)
+def test_pulled_before_the_soak_is_unknown(coverage, caplog):
+    # A long-running task pulled its image once, weeks ago, and still runs it: nothing here can tell.
+    repo = Repo()
+    without_in_use_data(
+        repo, "long-running", coverage, tags=["abc"], pulled=30, platform_pulled=30
+    )
+    with caplog.at_level("INFO"):
+        summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["protected"]["in_use"] == 0
+    assert summary["protected"]["in_use_unknown"] == 1
+    assert summary["judged_never_pulled"] == 0
+    line, _ = logged(caplog)
+    assert line["action"] == "kept"
+    assert line["reasons"] == ["in_use_unknown"]
+    assert line["use_judged_by"] == "unknown"
+    assert line["never_pulled"] is False
+
+
+def test_an_index_pulled_recently_whose_platform_image_was_never_pulled_is_not_in_use():
+    # The job's own BatchGetImage of the index each run records a pull of the index, and of nothing else.
+    repo = Repo()
+    made = without_in_use_data(
+        repo, "read", "no-coverage-record", tags=["abc"], pulled=0.1
+    )
+    summary = repo.run(deletions=deletes(made))
+    assert summary["deleted"] == 1
+    assert summary["judged_never_pulled"] == 1
+
+
+@pytest.mark.parametrize(
+    "pulled, reason",
+    [(1, "in_use"), (30, "in_use_unknown")],
+    ids=["within-the-soak", "before-the-soak"],
+)
+def test_indexes_sharing_a_platform_image_one_of_them_pulled(pulled, reason):
+    # A pull through the first index records the shared platform image's pull: one record, which counts for both.
+    repo = Repo()
+    first = without_in_use_data(
+        repo,
+        "first",
+        "no-coverage-record",
+        tags=["a"],
+        pushed=40,
+        pulled=pulled,
+        platform_pulled=pulled,
+    )
+    repo.index("second", tags=["b"], pushed=30, platforms=[first["platform"]])
+    summary = repo.run()
+    assert summary["vulnerable"] == 2
+    assert summary["deleted"] == 0
+    assert summary["judged_never_pulled"] == 0
+    assert summary["protected"][reason] == 2
+
+
+@pytest.mark.parametrize("coverage", ["no-coverage-record", "unused"])
+def test_an_attestations_pull_changes_nothing(coverage):
+    # A runtime doesn't pull an attestation to run the image; a scanner may. Its pull protects nothing, by ECR's
+    # pull record or by Inspector's data.
+    repo = Repo()
+    made = repo.index("old", tags=["abc"], attestation_pulled=0.1)
+    repo.vulnerable(made["platform"])
+    if coverage == "unused":
+        repo.unused(made["platform"])
+    summary = repo.run(deletions=deletes(made))
+    assert summary["deleted"] == 1
+    assert summary["protected"]["in_use"] == 0
+    assert summary["judged_never_pulled"] == int(coverage == "no-coverage-record")
+
+
+@pytest.mark.parametrize(
+    "offset, deleted",
+    [(timedelta(seconds=-1), False), (timedelta(seconds=1), True)],
+    ids=["a-second-before", "a-second-after"],
+)
+def test_an_image_pushed_before_ecr_recorded_pulls_is_unknown(offset, deleted):
+    # Pulled before ECR recorded pulls, it carries no record of that pull.
+    repo = Repo()
+    pushed = (NOW - selection.PULL_RECORD_START - offset) / timedelta(days=1)
+    made = without_in_use_data(
+        repo, "ancient", "no-coverage-record", tags=["abc"], pushed=pushed
+    )
+    summary = repo.run(deletions=deletes(made) if deleted else [])
+    assert summary["deleted"] == int(deleted)
+    assert summary["protected"]["in_use_unknown"] == int(not deleted)
+    assert summary["judged_never_pulled"] == int(deleted)
 
 
 @pytest.mark.parametrize(
@@ -917,10 +1079,7 @@ def test_dry_run_calls_no_delete(caplog):
 
 def test_one_line_per_deleted_image_and_one_summary(caplog):
     repo = Repo()
-    made = vulnerable_index(repo, "old", tags=["abc1234"])
-    for detail in repo.details:
-        if detail["imageDigest"] == made["platform"]:
-            detail["lastRecordedPullTime"] = days_ago(10)
+    made = vulnerable_index(repo, "old", tags=["abc1234"], platform_pulled=10)
     repo.vulnerable(
         made["platform"], vulnerability="CVE-2026-0002", severity="CRITICAL"
     )
@@ -940,7 +1099,10 @@ def test_one_line_per_deleted_image_and_one_summary(caplog):
     assert line["pushed_at"] == days_ago(30).isoformat()
     assert line["last_in_use_at"] == days_ago(30).isoformat()
     assert line["last_pulled_at"] == days_ago(10).isoformat()
+    assert line["use_judged_by"] == "inspector"
+    assert line["never_pulled"] is False
     assert summary["summary"]["deleted"] == 1
+    assert summary["summary"]["judged_never_pulled"] == 0
 
 
 # --- Settings ---
