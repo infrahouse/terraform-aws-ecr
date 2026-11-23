@@ -1,9 +1,9 @@
 """
 Deletes the images of one ECR repository that Inspector reports vulnerable and that nothing protects.
 
-A run reads the repository and Inspector, decides (see ``selection``), then deletes up to the cap, or in a dry run, only
-logs what it would delete. Any error from AWS, throttling that outlasts the retries, or a page it can't read fails the
-run before it deletes anything: the monitored Lambda alarms.
+A run reads the repository and Inspector, decides (see ``selection``), reads again the images it judged never pulled,
+then deletes up to the cap, or in a dry run, only logs what it would delete. Any error from AWS, throttling that
+outlasts the retries, or a page it can't read fails the run before it deletes anything: the monitored Lambda alarms.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Mapping, Sequence
 
@@ -42,6 +44,12 @@ REQUIRED_MODEL_FIELDS = {
     ("ecr", "DescribeImagesFilter"): ("imageStatus",),
     ("ecr", "ImageDetail"): ("imageStatus", "lastRecordedPullTime"),
 }
+# For about five minutes after an image's first pull shows, DescribeImages answers flap: in the test account, 22% to 60%
+# of reads lost the pull time, in runs of up to 18 s. So the images judged never pulled are read again before the job
+# deletes: 13 reads, 10 s apart, a span of 2 minutes. Replayed against the reads that measured the flapping, that
+# schedule lost the pull in none of about 15,000 start times. It fits the function's 300 s timeout.
+RECHECK_READS = 13
+RECHECK_INTERVAL = 10.0
 
 
 class CleanupError(RuntimeError):
@@ -128,7 +136,59 @@ def decide(settings: Settings, ecr: Any, inspector: Any, now: datetime) -> Plan:
     evidence = Evidence.build(
         read_findings(settings, inspector), read_coverage(settings, inspector), settings
     )
-    return selection.plan(repository, evidence, settings, now)
+    plan = selection.plan(repository, evidence, settings, now)
+    # One answer without a pull time isn't enough to delete: read again every image the plan judged never pulled. A
+    # pull a read shows can only protect more, so judging again with it needs no further read.
+    digests = plan.never_pulled_digests
+    if not digests:
+        return plan
+    pulls = recheck_pulls(settings, ecr, digests)
+    _log(
+        "recheck",
+        settings,
+        {
+            "never_pulled": digests,
+            "pulled": {digest: moment.isoformat() for digest, moment in pulls.items()},
+        },
+    )
+    if pulls:
+        plan = selection.plan(repository.with_pulls(pulls), evidence, settings, now)
+    return replace(plan, pulled_on_recheck=tuple(pulls))
+
+
+def recheck_pulls(
+    settings: Settings, ecr: Any, digests: Sequence[str]
+) -> Dict[str, datetime]:
+    """
+    Read images again with DescribeImages, ``RECHECK_READS`` times, ``RECHECK_INTERVAL`` seconds apart.
+
+    :param settings: The job's settings.
+    :param ecr: An ECR client.
+    :param digests: The images.
+    :return: For each image any read showed a pull of, the latest pull time a read gave.
+    :raise CleanupError: if ECR doesn't return one of them.
+    """
+    pulls: Dict[str, datetime] = {}
+    for number in range(RECHECK_READS):
+        if number:
+            time.sleep(RECHECK_INTERVAL)
+        for chunk in _chunks(digests, BATCH_SIZE):
+            details = ecr.describe_images(
+                registryId=settings.registry_id,
+                repositoryName=settings.repository_name,
+                imageIds=[{"imageDigest": digest} for digest in chunk],
+            )["imageDetails"]
+            missing = sorted(set(chunk) - {detail["imageDigest"] for detail in details})
+            if missing:
+                raise CleanupError(f"ECR didn't return the images {missing}")
+            for detail in details:
+                moment = detail.get("lastRecordedPullTime")
+                digest = detail["imageDigest"]
+                if moment is not None and (
+                    digest not in pulls or moment > pulls[digest]
+                ):
+                    pulls[digest] = moment
+    return pulls
 
 
 def read_images(settings: Settings, ecr: Any) -> List[Dict[str, Any]]:

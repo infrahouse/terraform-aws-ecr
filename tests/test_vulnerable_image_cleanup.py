@@ -21,6 +21,8 @@ import cleanup
 import selection
 
 NOW = datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc)
+# The function's own schedule of reads again, before the quick_recheck fixture shortens it.
+REAL_RECHECK = (cleanup.RECHECK_READS, cleanup.RECHECK_INTERVAL)
 REGISTRY = "111122223333"
 REPOSITORY = "test-repo"
 REGION = "us-west-2"
@@ -259,16 +261,22 @@ class Repo:
         deletions: Iterable[Sequence[str]] = (),
         refused: Optional[Dict[str, str]] = None,
         throttled: Optional[int] = None,
+        recheck: Sequence[str] = (),
+        recheck_pulls: Sequence[Dict[str, float]] = (),
         **overrides: Any,
     ) -> Dict[str, Any]:
         """
         Run the cleanup. ``deletions`` are the BatchDeleteImage calls the run must make, in order; any other delete
         fails the test. ECR refuses the images in ``refused`` with their failure codes, and the call numbered
-        ``throttled`` (from 0) fails with ThrottlingException.
+        ``throttled`` (from 0) fails with ThrottlingException. ``recheck`` are the images the run must read again,
+        in order, before it deletes; ``recheck_pulls`` gives, for each of those reads, the pull times (days before
+        NOW) it shows.
         """
         ecr, inspector = clients()
         with Stubber(ecr) as ecr_stub, Stubber(inspector) as inspector_stub:
             self.stub_reads(ecr_stub, inspector_stub)
+            if recheck:
+                self.stub_recheck(ecr_stub, recheck, recheck_pulls)
             for number, batch in enumerate(deletions):
                 if number == throttled:
                     ecr_stub.add_client_error(
@@ -311,6 +319,32 @@ class Repo:
             inspector_stub.assert_no_pending_responses()
         return summary
 
+    def stub_recheck(
+        self,
+        ecr_stub: Stubber,
+        digests: Sequence[str],
+        pulls_per_read: Sequence[Dict[str, float]] = (),
+    ) -> None:
+        """Answer the run's reads again of ``digests``: ``cleanup.RECHECK_READS`` DescribeImages calls."""
+        details = {detail["imageDigest"]: detail for detail in self.details}
+        for number in range(cleanup.RECHECK_READS):
+            pulls = pulls_per_read[number] if number < len(pulls_per_read) else {}
+            answers = []
+            for image_digest in digests:
+                answer = dict(details[image_digest])
+                if image_digest in pulls:
+                    answer["lastRecordedPullTime"] = days_ago(pulls[image_digest])
+                answers.append(answer)
+            ecr_stub.add_response(
+                "describe_images",
+                {"imageDetails": answers},
+                {
+                    "registryId": REGISTRY,
+                    "repositoryName": REPOSITORY,
+                    "imageIds": [{"imageDigest": image} for image in digests],
+                },
+            )
+
     def stub_reads(self, ecr_stub: Stubber, inspector_stub: Stubber) -> None:
         self.stub_ecr_reads(ecr_stub)
         inspector_stub.add_response("list_findings", {"findings": self.findings})
@@ -346,6 +380,13 @@ class Repo:
                     "failures": [],
                 },
             )
+
+
+@pytest.fixture(autouse=True)
+def quick_recheck(monkeypatch):
+    """Three reads again, without the wait between them; one test checks the real schedule."""
+    monkeypatch.setattr(cleanup, "RECHECK_READS", 3)
+    monkeypatch.setattr(cleanup, "RECHECK_INTERVAL", 0)
 
 
 def clients():
@@ -682,9 +723,9 @@ def test_platform_images_judged_by_inspector_and_by_ecr_pull_record(caplog):
     repo = Repo()
     index, amd, arm = multi_platform(repo)
     with caplog.at_level("INFO"):
-        summary = repo.run(deletions=[[index], [amd, arm]])
+        summary = repo.run(deletions=[[index], [amd, arm]], recheck=[arm])
     assert summary["deleted"] == 1
-    line, _ = logged(caplog)
+    (line,) = image_lines(caplog)
     assert line["use_judged_by"] == "ecr_pull_record"
     assert line["never_pulled"] is True
 
@@ -713,11 +754,11 @@ def test_never_pulled_is_not_in_use(coverage, caplog):
     repo = Repo()
     made = without_in_use_data(repo, "old", coverage, tags=["abc"])
     with caplog.at_level("INFO"):
-        summary = repo.run(deletions=deletes(made))
+        summary = repo.run(deletions=deletes(made), recheck=[made["platform"]])
     assert summary["deleted"] == 1
     assert summary["protected"] == dict.fromkeys(selection.REASONS, 0)
     assert summary["judged_never_pulled"] == 1
-    line, _ = logged(caplog)
+    (line,) = image_lines(caplog)
     assert line["action"] == "deleted"
     assert line["use_judged_by"] == "ecr_pull_record"
     assert line["never_pulled"] is True
@@ -734,7 +775,7 @@ def test_pulled_within_the_soak_is_in_use(coverage, caplog):
     assert summary["protected"]["in_use"] == 1
     assert summary["protected"]["in_use_unknown"] == 0
     assert summary["judged_never_pulled"] == 0
-    line, _ = logged(caplog)
+    (line,) = image_lines(caplog)
     assert line["action"] == "kept"
     assert line["reasons"] == ["in_use"]
     assert line["use_judged_by"] == "ecr_pull_record"
@@ -754,7 +795,7 @@ def test_pulled_before_the_soak_is_unknown(coverage, caplog):
     assert summary["protected"]["in_use"] == 0
     assert summary["protected"]["in_use_unknown"] == 1
     assert summary["judged_never_pulled"] == 0
-    line, _ = logged(caplog)
+    (line,) = image_lines(caplog)
     assert line["action"] == "kept"
     assert line["reasons"] == ["in_use_unknown"]
     assert line["use_judged_by"] == "unknown"
@@ -767,7 +808,7 @@ def test_an_index_pulled_recently_whose_platform_image_was_never_pulled_is_not_i
     made = without_in_use_data(
         repo, "read", "no-coverage-record", tags=["abc"], pulled=0.1
     )
-    summary = repo.run(deletions=deletes(made))
+    summary = repo.run(deletions=deletes(made), recheck=[made["platform"]])
     assert summary["deleted"] == 1
     assert summary["judged_never_pulled"] == 1
 
@@ -799,14 +840,17 @@ def test_indexes_sharing_a_platform_image_one_of_them_pulled(pulled, reason):
 
 @pytest.mark.parametrize("coverage", ["no-coverage-record", "unused"])
 def test_an_attestations_pull_changes_nothing(coverage):
-    # A runtime doesn't pull an attestation to run the image; a scanner may. Its pull protects nothing, by ECR's
-    # pull record or by Inspector's data.
+    # A scanner may fetch an attestation alone; a pull that fetches it fetches the platform image too. Its pull
+    # protects nothing, by ECR's pull record or by Inspector's data.
     repo = Repo()
     made = repo.index("old", tags=["abc"], attestation_pulled=0.1)
     repo.vulnerable(made["platform"])
     if coverage == "unused":
         repo.unused(made["platform"])
-    summary = repo.run(deletions=deletes(made))
+    summary = repo.run(
+        deletions=deletes(made),
+        recheck=[made["platform"]] if coverage == "no-coverage-record" else [],
+    )
     assert summary["deleted"] == 1
     assert summary["protected"]["in_use"] == 0
     assert summary["judged_never_pulled"] == int(coverage == "no-coverage-record")
@@ -824,10 +868,145 @@ def test_an_image_pushed_before_ecr_recorded_pulls_is_unknown(offset, deleted):
     made = without_in_use_data(
         repo, "ancient", "no-coverage-record", tags=["abc"], pushed=pushed
     )
-    summary = repo.run(deletions=deletes(made) if deleted else [])
+    summary = repo.run(
+        deletions=deletes(made) if deleted else [],
+        recheck=[made["platform"]] if deleted else [],
+    )
     assert summary["deleted"] == int(deleted)
     assert summary["protected"]["in_use_unknown"] == int(not deleted)
     assert summary["judged_never_pulled"] == int(deleted)
+
+
+# --- Reading again before deleting ---
+
+
+def never_pulled_index(repo: Repo, name: str, **kwargs: Any) -> Dict[str, str]:
+    """An index Inspector reports vulnerable and gives no in-use data on, which the first read shows never pulled."""
+    return without_in_use_data(repo, name, "no-coverage-record", **kwargs)
+
+
+@pytest.mark.parametrize("read", [0, 2], ids=["first-read", "last-read"])
+def test_a_pull_one_read_again_shows_keeps_the_image(read, caplog):
+    # For a few minutes after a first pull, ECR's answers flap: one read shows the pull, the next doesn't.
+    repo = Repo()
+    made = never_pulled_index(repo, "deployed", tags=["abc"])
+    pulls: List[Dict[str, float]] = [{}, {}, {}]
+    pulls[read] = {made["platform"]: 0.001}
+    with caplog.at_level("INFO"):
+        summary = repo.run(recheck=[made["platform"]], recheck_pulls=pulls)
+    assert summary["deleted"] == 0
+    assert summary["pulled_on_recheck"] == 1
+    assert summary["protected"]["in_use"] == 1
+    assert summary["judged_never_pulled"] == 0
+    (recheck,) = [line for line in logged(caplog) if line.get("action") == "recheck"]
+    assert recheck["never_pulled"] == [made["platform"]]
+    assert list(recheck["pulled"]) == [made["platform"]]
+
+
+def test_an_old_pull_a_read_again_shows_keeps_the_image_as_unknown():
+    repo = Repo()
+    made = never_pulled_index(repo, "old", tags=["abc"])
+    summary = repo.run(
+        recheck=[made["platform"]], recheck_pulls=[{made["platform"]: 30}]
+    )
+    assert summary["deleted"] == 0
+    assert summary["protected"]["in_use_unknown"] == 1
+
+
+def test_the_reads_again_cover_the_candidates_the_cap_leaves():
+    # A pull found on the oldest candidate frees its place under the cap for the next, which was read again too.
+    repo = Repo()
+    older = never_pulled_index(repo, "older", tags=["a"], pushed=40)
+    newer = never_pulled_index(repo, "newer", tags=["b"], pushed=30)
+    summary = repo.run(
+        deletions=deletes(newer),
+        recheck=[older["platform"], newer["platform"]],
+        recheck_pulls=[{older["platform"]: 0.001}],
+        max_deletions=1,
+    )
+    assert summary["deleted"] == 1
+    assert summary["left_by_cap"] == 0
+    assert summary["pulled_on_recheck"] == 1
+
+
+@pytest.mark.parametrize("pulled", [False, True], ids=["never-pulled", "pulled"])
+def test_a_shared_platform_image_is_read_again_once(pulled):
+    repo = Repo()
+    first = never_pulled_index(repo, "first", tags=["a"], pushed=40)
+    second = repo.index("second", tags=["b"], pushed=30, platforms=[first["platform"]])
+    both = [
+        [first["index"]],
+        [first["attestation"]],
+        [second["index"]],
+        [first["platform"], second["attestation"]],
+    ]
+    summary = repo.run(
+        deletions=[] if pulled else both,
+        recheck=[first["platform"]],
+        recheck_pulls=[{first["platform"]: 0.001}] if pulled else [],
+    )
+    assert summary["deleted"] == (0 if pulled else 2)
+    assert summary["protected"]["in_use"] == (2 if pulled else 0)
+
+
+def test_a_dry_run_reads_again_too():
+    repo = Repo()
+    made = never_pulled_index(repo, "old", tags=["abc"])
+    summary = repo.run(recheck=[made["platform"]], dry_run=True)
+    assert summary["would_delete"] == 1
+    assert summary["deleted"] == 0
+
+
+def test_a_read_again_that_fails_deletes_nothing():
+    # No delete is stubbed, so a delete would fail the test with another error than the ClientError.
+    repo = Repo()
+    never_pulled_index(repo, "old", tags=["abc"])
+    ecr, inspector = clients()
+    with Stubber(ecr) as ecr_stub, Stubber(inspector) as inspector_stub:
+        repo.stub_reads(ecr_stub, inspector_stub)
+        ecr_stub.add_client_error(
+            "describe_images",
+            service_error_code="ThrottlingException",
+            http_status_code=400,
+        )
+        with pytest.raises(ClientError, match="ThrottlingException"):
+            cleanup.run(settings(), ecr, inspector, NOW)
+
+
+def test_an_image_a_read_again_does_not_return_fails_the_run():
+    repo = Repo()
+    made = never_pulled_index(repo, "old", tags=["abc"])
+    ecr, inspector = clients()
+    with Stubber(ecr) as ecr_stub, Stubber(inspector) as inspector_stub:
+        repo.stub_reads(ecr_stub, inspector_stub)
+        ecr_stub.add_response(
+            "describe_images",
+            {"imageDetails": []},
+            {
+                "registryId": REGISTRY,
+                "repositoryName": REPOSITORY,
+                "imageIds": [{"imageDigest": made["platform"]}],
+            },
+        )
+        with pytest.raises(cleanup.CleanupError, match="didn't return the images"):
+            cleanup.run(settings(), ecr, inspector, NOW)
+
+
+def test_the_reads_again_span_two_minutes(monkeypatch):
+    # The schedule chosen by replaying it against the reads that measured ECR's flapping answers.
+    reads, interval = REAL_RECHECK
+    assert (reads, interval) == (13, 10.0)
+    monkeypatch.setattr(cleanup, "RECHECK_READS", reads)
+    monkeypatch.setattr(cleanup, "RECHECK_INTERVAL", interval)
+    slept: List[float] = []
+    monkeypatch.setattr(cleanup.time, "sleep", slept.append)
+    repo = Repo()
+    made = never_pulled_index(repo, "old", tags=["abc"])
+    assert repo.run(deletions=deletes(made), recheck=[made["platform"]])["deleted"] == 1
+    assert slept == [10.0] * 12
+
+
+# --- Fail closed: errors ---
 
 
 @pytest.mark.parametrize(
@@ -908,6 +1087,13 @@ def logged(caplog: pytest.LogCaptureFixture) -> List[Dict[str, Any]]:
         json.loads(record.getMessage())
         for record in caplog.records
         if record.getMessage().startswith("{")
+    ]
+
+
+def image_lines(caplog: pytest.LogCaptureFixture) -> List[Dict[str, Any]]:
+    """The run's JSON log lines about an image: neither the recheck's nor the summary."""
+    return [
+        line for line in logged(caplog) if line.get("action") not in (None, "recheck")
     ]
 
 

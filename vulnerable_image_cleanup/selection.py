@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import (
     Any,
@@ -342,6 +342,18 @@ class Repository:
             )
         return cls(images, references, frozenset(attestations))
 
+    def with_pulls(self, pulls: Mapping[str, datetime]) -> "Repository":
+        """
+        :param pulls: Pull times a later read gave, by digest.
+        :return: The repository, with each of those images' pull time the later of the two.
+        """
+        images = dict(self.images)
+        for digest, moment in pulls.items():
+            image = images[digest]
+            if image.last_pulled_at is None or moment > image.last_pulled_at:
+                images[digest] = replace(image, last_pulled_at=moment)
+        return Repository(images, self.references, self.attestations)
+
     def is_runnable(self, digest: str) -> bool:
         """
         :param digest: An image's digest.
@@ -470,6 +482,8 @@ class Verdict:
         runnable manifest.
     :param never_pulled: True if its use was judged from ECR's pull record, and ECR recorded no pull of any of its
         runnable manifests.
+    :param never_pulled_digests: Its runnable manifests judged never pulled: those whose judgement rests on ECR's
+        answer having no pull time.
     """
 
     unit: Unit
@@ -482,6 +496,7 @@ class Verdict:
     last_pulled_at: Optional[datetime]
     use_judged_by: Optional[str]
     never_pulled: bool
+    never_pulled_digests: Tuple[str, ...]
 
     @property
     def is_vulnerable(self) -> bool:
@@ -554,12 +569,32 @@ class Plan:
     :param deletions: The units to delete, oldest first, up to the cap.
     :param left_by_cap: The candidates the cap leaves for a later run.
     :param manifests_seen: How many manifests the repository holds.
+    :param pulled_on_recheck: The manifests judged never pulled that a read before deleting showed a pull of.
     """
 
     verdicts: Tuple[Verdict, ...]
     deletions: Tuple[Deletion, ...]
     left_by_cap: Tuple[Verdict, ...]
     manifests_seen: int
+    pulled_on_recheck: Tuple[str, ...] = ()
+
+    @property
+    def never_pulled_digests(self) -> List[str]:
+        """
+        :return: The manifests judged never pulled in every candidate, the cap's leftovers included, once each: what
+            the job reads again before deleting. A pull a read finds can only protect more, so the candidates after
+            it are among these.
+        """
+        candidates = [deletion.verdict for deletion in self.deletions] + list(
+            self.left_by_cap
+        )
+        return list(
+            dict.fromkeys(
+                digest
+                for verdict in candidates
+                for digest in verdict.never_pulled_digests
+            )
+        )
 
     @property
     def kept_vulnerable(self) -> List[Verdict]:
@@ -589,6 +624,7 @@ class Plan:
                 for reason in REASONS
             },
             "judged_never_pulled": sum(verdict.never_pulled for verdict in vulnerable),
+            "pulled_on_recheck": len(self.pulled_on_recheck),
             "candidates": len(self.deletions) + len(self.left_by_cap),
             "deleted": 0 if settings.dry_run else len(self.deletions),
             "would_delete": len(self.deletions) if settings.dry_run else 0,
@@ -688,7 +724,8 @@ def judge(
     # Only the pulls of what a container runs count: a platform image or a single manifest. An index's own pull time
     # doesn't: the job reads every index with BatchGetImage each run, and ECR records that read as a pull. A real pull
     # of an index records its platform image's pull too, and the job never reads those, so their pull times still say
-    # when the image was last pulled. An attestation's doesn't either: a runtime doesn't pull one to run the image.
+    # when the image was last pulled. An attestation's doesn't either: a pull that fetches it, as docker pull may,
+    # fetches the platform image too, and a tool such as a scanner may fetch the attestation alone.
     runnable = [image for image in images if repository.is_runnable(image.digest)]
     pulls = [
         image.last_pulled_at for image in runnable if image.last_pulled_at is not None
@@ -699,7 +736,10 @@ def judge(
         reasons.add(IN_USE)
     # Fail closed: the use of every manifest a container could run must be judged, by Inspector or by ECR's pull
     # record. A unit is unknown when any of them is.
-    uses = {_judge_use(image, evidence, soak_start) for image in runnable}
+    use_by_digest = {
+        image.digest: _judge_use(image, evidence, soak_start) for image in runnable
+    }
+    uses = set(use_by_digest.values())
     if _UNKNOWN in uses:
         reasons.add(IN_USE_UNKNOWN)
         use_judged_by: Optional[str] = JUDGED_UNKNOWN
@@ -725,6 +765,9 @@ def judge(
         last_pulled_at=max(pulls, default=None),
         use_judged_by=use_judged_by,
         never_pulled=use_judged_by == JUDGED_BY_PULL_RECORD and not pulls,
+        never_pulled_digests=tuple(
+            digest for digest, use in use_by_digest.items() if use == _NEVER_PULLED
+        ),
     )
 
 
