@@ -22,9 +22,9 @@ inputs, in an order that protects what runs:
 - **The rule order, computed.** Retained tags first, then rollback candidates, then tagged images, then untagged ones.
   Add a retained tag, and the other rules move down without renumbering.
 - **Vulnerable image cleanup.** Inspector reports vulnerabilities in every image it monitors, used or not. A daily
-  Lambda deletes the vulnerable images that nothing protects. It keeps what the lifecycle policy keeps, what runs or
-  ran recently, what was pushed recently, and anything whose use it can't judge. It runs dry until you turn deletion
-  on, and fails closed.
+  Lambda deletes the vulnerable images that nothing protects. It keeps the retained images and the rollback candidates
+  the lifecycle policy keeps, what runs or ran recently, what was pushed recently, and anything whose use it can't
+  judge. It runs dry until you turn deletion on, and fails closed.
 
 The module creates the repository and its lifecycle policy, and the cleanup when it is on. It sets no repository
 policy, replication, scanning or encryption options.
@@ -39,7 +39,7 @@ policy, replication, scanning or encryption options.
 - **Vulnerable image cleanup**, off by default and dry when on: a scheduled Lambda, monitored by
   [terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored), with alarm emails
   and JSON logs of every decision.
-- **Terraform 1.9 or later and AWS provider 6** (`>= 6.0, < 7.0`).
+- **Terraform 1.9 or later, below 2.0, and AWS provider 6** (`>= 6.0, < 7.0`).
 
 ## Quick Start
 

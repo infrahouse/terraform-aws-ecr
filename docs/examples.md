@@ -94,6 +94,7 @@ module "ecr" {
   rollback_candidate_retain_count = 5
   expire_count_tagged             = 30
   tag_pattern_list                = ["*"]
+  expire_days_untagged            = 7
 
   vulnerable_image_cleanup_enabled      = true
   vulnerable_image_cleanup_alarm_emails = ["ops@example.com"]
@@ -103,9 +104,10 @@ module "ecr" {
 }
 ```
 
-It protects what the lifecycle policy keeps: the retained image and the 5 newest rollback candidates. It also keeps
-an image in use or used within 2 days, an image pushed within 7 days, and an image whose use it can't judge. Each run
-deletes at most 10 images, the oldest first, once deletion is on.
+It protects the retained image and the 5 newest rollback candidates, as the lifecycle policy keeps them. The
+tagged-image rule protects nothing from it: a vulnerable image among the 30 newest tagged images is deleted unless
+something else protects it. It also keeps an image in use or used within 2 days, an image pushed within 7 days, and an
+image whose use it can't judge. Each run deletes at most 10 images, the oldest first, once deletion is on.
 
 It needs Amazon Inspector's ECR scanning in the account and Region, and `python3`, `pip3`, the AWS CLI and `jq` where
 Terraform runs. The example's README shows how to run it now and read its log lines. A deletion can't be undone: before

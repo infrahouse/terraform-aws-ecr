@@ -47,8 +47,8 @@ image at most carries a tag. A rollback candidate is an image with a tag that st
 `rollback_candidate_tag_prefix`. The tagged images' filter is `tag_prefix_list` or `tag_pattern_list`.
 
 A rule that is off leaves a gap in the priorities, which ECR allows. For example, `retain_tags = ["pinned-1",
-"pinned-2"]`, `rollback_candidate_retain_count = 3`, `expire_days_tagged = 365` and `expire_count_untagged = 5` give
-rules at priorities 1, 2, 3, 6 and 7.
+"pinned-2"]`, `rollback_candidate_retain_count = 3`, `expire_days_tagged = 365` with `tag_prefix_list = ["v"]`, and
+`expire_count_untagged = 5` give rules at priorities 1, 2, 3, 6 and 7.
 
 ECR accepts only one rule per tag filter and one rule for untagged images. So of each pair, the count and the days,
 set one: a policy with both is refused at `terraform apply` (see [Troubleshooting](troubleshooting.md)). The module
@@ -126,9 +126,10 @@ All in `vulnerable_image_cleanup.tf`, each with `count`, so none of it exists wh
   [terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored) 2.2.1:
   `<repo_name>-<hash>-vuln-cleanup` (the repository's name made safe for Lambda, cut to 40 characters, and 6
   characters of its MD5), Python 3.12, a 300-second timeout and 256 MB. Its code is the `vulnerable_image_cleanup/`
-  directory, packaged where Terraform runs. lambda-monitored also creates the log group, `/aws/lambda/<function name>`,
-  kept 365 days; an SNS topic that emails `vulnerable_image_cleanup_alarm_emails`; an alarm on any error, and one on
-  throttling.
+  directory, packaged where Terraform runs. lambda-monitored also creates an S3 bucket, through
+  [terraform-aws-s3-bucket](https://github.com/infrahouse/terraform-aws-s3-bucket), that holds the package; the log
+  group, `/aws/lambda/<function name>`, kept 365 days; an SNS topic that emails
+  `vulnerable_image_cleanup_alarm_emails`; an alarm on any error, and one on throttling.
 - **An IAM policy** for the function's role:
     - `ecr:DescribeImages` and `ecr:BatchGetImage` on this repository;
     - `ecr:BatchDeleteImage` on this repository, only when `vulnerable_image_cleanup_dry_run` is false;
@@ -190,7 +191,11 @@ manifest it references. Each kept image's log line lists its reasons:
 - **`in_use_unknown`**: the function can't tell whether it is in use. See [How It Judges Use](#how-it-judges-use).
 - **`recent`**: it was pushed within `vulnerable_image_cleanup_min_age_days`, so an image waiting for its pin isn't
   deleted.
-- **`not_active`**: it isn't ACTIVE: an archived image. The lifecycle rules don't select those either.
+- **`not_active`**: it isn't ACTIVE: it is archived, or being restored. The lifecycle rules select ACTIVE images
+  only, too.
+
+The other lifecycle rules protect nothing from the cleanup: an image the `expire_*` rules keep is deleted if it is
+vulnerable and none of the reasons above holds.
 
 When two indexes share a platform image and only one is kept, the other index is deleted and the shared image stays.
 

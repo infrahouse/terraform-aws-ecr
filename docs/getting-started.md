@@ -23,8 +23,8 @@ module that pins AWS provider 5 fails at `terraform init`; see
 ### AWS Permissions
 
 Whoever runs Terraform needs to manage ECR repositories and their lifecycle policies. With the cleanup on, they also
-need to manage IAM roles and policies, Lambda functions, CloudWatch log groups and alarms, SNS topics and EventBridge
-rules.
+need to manage S3 buckets and objects (the function's package goes to a bucket that terraform-aws-lambda-monitored
+creates), IAM roles and policies, Lambda functions, CloudWatch log groups and alarms, SNS topics and EventBridge rules.
 
 ### For the Vulnerable Image Cleanup
 
