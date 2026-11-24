@@ -11,8 +11,14 @@ locals {
     substr(md5(var.repo_name), 0, 6),
     "vuln-cleanup",
   ])
-  # The repository's Region, from its ARN: the function reads ECR and Inspector there.
-  repository_region = split(":", aws_ecr_repository.repo.arn)[3]
+  # The repository's partition and Region, from its ARN (arn:<partition>:ecr:<region>:<account>:repository/<name>):
+  # the function reads ECR, Inspector, ECS and Lambda there, in the repository's account.
+  repository_partition = split(":", aws_ecr_repository.repo.arn)[1]
+  repository_region    = split(":", aws_ecr_repository.repo.arn)[3]
+  # ECS's and Lambda's ARNs in the repository's account and Region.
+  repository_account = aws_ecr_repository.repo.registry_id
+  ecs_arn_prefix     = "arn:${local.repository_partition}:ecs:${local.repository_region}:${local.repository_account}"
+  lambda_arn_prefix  = "arn:${local.repository_partition}:lambda:${local.repository_region}:${local.repository_account}"
   cleanup_tags = {
     environment : var.environment
     service : var.service_name
@@ -24,8 +30,9 @@ data "aws_iam_policy_document" "vulnerable_image_cleanup" {
   count = local.cleanup_enabled ? 1 : 0
 
   statement {
-    sid       = "ReadRepository"
-    actions   = ["ecr:DescribeImages", "ecr:BatchGetImage"]
+    sid = "ReadRepository"
+    # GetRepositoryPolicy: whether anyone outside the account may pull, and run images the function can't see.
+    actions   = ["ecr:DescribeImages", "ecr:BatchGetImage", "ecr:GetRepositoryPolicy"]
     resources = [aws_ecr_repository.repo.arn]
   }
   # A dry run gets no delete permission at all.
@@ -42,6 +49,49 @@ data "aws_iam_policy_document" "vulnerable_image_cleanup" {
     sid       = "ReadInspector"
     actions   = ["inspector2:ListFindings", "inspector2:ListCoverage"]
     resources = ["*"]
+  }
+
+  # What ECS and Lambda run, in the repository's account and Region: every cluster's running tasks, every service's
+  # deployed task definitions, every version of every container image function. Read-only.
+  # ListClusters and DescribeTaskDefinition take no resource ARN.
+  statement {
+    sid       = "ListEcsClustersAndTaskDefinitions"
+    actions   = ["ecs:ListClusters", "ecs:DescribeTaskDefinition"]
+    resources = ["*"]
+  }
+  # ListTasks names the container-instance resource type and ListServices none; both take the ecs:cluster key, which
+  # holds them to this account's and Region's clusters.
+  statement {
+    sid       = "ListEcsTasksAndServices"
+    actions   = ["ecs:ListTasks", "ecs:ListServices"]
+    resources = ["*"]
+    condition {
+      test     = "ArnLike"
+      variable = "ecs:cluster"
+      values   = ["${local.ecs_arn_prefix}:cluster/*"]
+    }
+  }
+  statement {
+    sid       = "DescribeEcsTasks"
+    actions   = ["ecs:DescribeTasks"]
+    resources = ["${local.ecs_arn_prefix}:task/*"]
+  }
+  statement {
+    sid       = "DescribeEcsServices"
+    actions   = ["ecs:DescribeServices"]
+    resources = ["${local.ecs_arn_prefix}:service/*"]
+  }
+  # ListFunctions takes no resource ARN.
+  statement {
+    sid       = "ListLambdaFunctions"
+    actions   = ["lambda:ListFunctions"]
+    resources = ["*"]
+  }
+  # A function's ARN, and a version's (function:<name>:<version>), which the wildcard covers.
+  statement {
+    sid       = "GetLambdaFunctions"
+    actions   = ["lambda:GetFunction"]
+    resources = ["${local.lambda_arn_prefix}:function:*"]
   }
 }
 
