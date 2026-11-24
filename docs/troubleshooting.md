@@ -83,8 +83,13 @@ The module checks its inputs at plan, and its error says what is wrong. The ones
 
 ### `terraform apply` Fails While Building the Cleanup's Package
 
-With the cleanup on, terraform-aws-lambda-monitored builds the function's package on the host that runs Terraform,
-with `python3`, `pip3`, the AWS CLI and `jq`. Install the missing one there, or run Terraform where they are.
+```
+ERROR: Required command 'python3' not found
+```
+
+or `ERROR: jq is required but not installed`. With the cleanup on, terraform-aws-lambda-monitored builds the
+function's package on the host that runs Terraform: `python3` and `pip3` build it, and its scripts call the AWS CLI
+and `jq`. Install the missing one there, or run Terraform where they are.
 
 ## The Vulnerable Image Cleanup
 
