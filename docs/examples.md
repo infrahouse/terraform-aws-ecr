@@ -13,7 +13,7 @@ Directory: [examples/basic](https://github.com/infrahouse/terraform-aws-ecr/tree
 ```hcl
 module "ecr" {
   source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-  version = "1.1.0"
+  version = "1.1.1"
 
   repo_name    = "my-service"
   environment  = "production"
@@ -41,7 +41,7 @@ rollbacks, and the images something pins by tag never expire. Directory:
 ```hcl
 module "ecr" {
   source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-  version = "1.1.0"
+  version = "1.1.1"
 
   repo_name    = "my-service"
   environment  = "production"
@@ -84,7 +84,7 @@ that nothing protects. Directory:
 ```hcl
 module "ecr" {
   source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-  version = "1.1.0"
+  version = "1.1.1"
 
   repo_name    = "my-service"
   environment  = "production"
