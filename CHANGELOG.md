@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.1] - 2026-11-24
+
+### Bug Fixes
+
+- Describe each ECS service's revisions on their own
+- Describe each ECS service's deployment on its own too
+
+### Documentation
+
+- Each service's deployment and revisions are described on their own
+
+### Testing
+
+- A second ECS service in the cleanup's dry-run test
+
 ## [1.1.0] - 2026-11-24
 
 ### Documentation
