@@ -30,8 +30,7 @@ LOG.setLevel(logging.INFO)
 # Throttling and transient errors are retried; once the retries run out, the error fails the run.
 BOTO_CONFIG = Config(retries={"mode": "standard", "max_attempts": 10})
 # BatchGetImage and BatchDeleteImage take at most 100 image ids; ECS's DescribeTasks 100 tasks, DescribeServices 10
-# services, DescribeServiceDeployments and DescribeServiceRevisions 20 ARNs, and DescribeServiceRevisions only those of
-# one service.
+# services, DescribeServiceDeployments and DescribeServiceRevisions 20 ARNs, all of one service.
 BATCH_SIZE = 100
 TASKS_BATCH_SIZE = 100
 SERVICES_BATCH_SIZE = 10
@@ -333,19 +332,20 @@ def read_ecs(ecs: Any, builder: RuntimeBuilder, services: bool) -> None:
             )
     # The current deployments of the services whose controller resolves tags: the revisions they replace, and the one
     # they roll back to.
-    deployments = _describe_all(
+    deployments = describe_by_service(
         ecs.describe_service_deployments,
         "serviceDeploymentArns",
         "serviceDeployments",
         "serviceDeploymentArn",
-        sorted(
-            {
-                service["currentServiceDeployment"]
-                for _, service in found
+        {
+            service["serviceArn"]: (
+                [service["currentServiceDeployment"]]
                 if selection.resolves_tags(service)
                 and service.get("currentServiceDeployment")
-            }
-        ),
+                else []
+            )
+            for _, service in found
+        },
         "service deployments",
     )
     revision_arns = {
@@ -358,20 +358,14 @@ def read_ecs(ecs: Any, builder: RuntimeBuilder, services: bool) -> None:
         )
         for _, service in found
     }
-    # ECS refuses a DescribeServiceRevisions request whose revisions belong to more than one service ("Cross service
-    # requests are not allowed"), so each service's are described on their own.
-    revisions: Dict[str, Mapping[str, Any]] = {}
-    for service_arn in sorted(revision_arns):
-        revisions.update(
-            _describe_all(
-                ecs.describe_service_revisions,
-                "serviceRevisionArns",
-                "serviceRevisions",
-                "serviceRevisionArn",
-                sorted(revision_arns[service_arn]),
-                "service revisions",
-            )
-        )
+    revisions = describe_by_service(
+        ecs.describe_service_revisions,
+        "serviceRevisionArns",
+        "serviceRevisions",
+        "serviceRevisionArn",
+        revision_arns,
+        "service revisions",
+    )
     task_definitions: Dict[str, Mapping[str, Any]] = {}
     for arn in sorted(
         {
@@ -627,6 +621,39 @@ def delete_images(settings: Settings, ecr: Any, digests: Sequence[str]) -> List[
     return deleted
 
 
+def describe_by_service(
+    describe: Any,
+    arns_param: str,
+    key: str,
+    arn_key: str,
+    arns_by_service: Mapping[str, Sequence[str]],
+    what: str,
+) -> Dict[str, Mapping[str, Any]]:
+    """
+    Describe service deployments or service revisions by ARN: each service's in requests of their own, as ECS refuses
+    a DescribeServiceDeployments or DescribeServiceRevisions request whose ARNs belong to more than one service ("Cross
+    service requests are not allowed"), and ``REVISIONS_BATCH_SIZE`` at a time. Services go in ARN order, and each
+    one's ARNs too.
+
+    :param describe: The client's describe method.
+    :param arns_param: Its parameter that takes the ARNs.
+    :param key: Where its answer's items are.
+    :param arn_key: Each item's ARN.
+    :param arns_by_service: The ARNs, by the ARN of the service they belong to.
+    :param what: What they are, for the error.
+    :return: The items, by ARN.
+    :raise CleanupError: if ECS gives a failure, or leaves one out.
+    """
+    items: Dict[str, Mapping[str, Any]] = {}
+    for service_arn in sorted(arns_by_service):
+        arns = sorted(set(arns_by_service[service_arn]))
+        for chunk in _chunks(arns, REVISIONS_BATCH_SIZE):
+            response = describe(**{arns_param: list(chunk)})
+            for item in _described(response, key, arn_key, chunk, what):
+                items[item[arn_key]] = item
+    return items
+
+
 def _chunks(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
@@ -639,34 +666,6 @@ def _paginate(client: Any, operation: str, key: str, **params: Any) -> List[Any]
     items: List[Any] = []
     for page in client.get_paginator(operation).paginate(**params):
         items.extend(page[key])
-    return items
-
-
-def _describe_all(
-    describe: Any,
-    arns_param: str,
-    key: str,
-    arn_key: str,
-    arns: Sequence[str],
-    what: str,
-) -> Dict[str, Mapping[str, Any]]:
-    """
-    Describe ECS resources by ARN, ``REVISIONS_BATCH_SIZE`` at a time.
-
-    :param describe: The client's describe method.
-    :param arns_param: Its parameter that takes the ARNs.
-    :param key: Where its answer's items are.
-    :param arn_key: Each item's ARN.
-    :param arns: The ARNs; for service revisions, those of one service only.
-    :param what: What they are, for the error.
-    :return: The items, by ARN.
-    :raise CleanupError: if ECS gives a failure, or leaves one out.
-    """
-    items: Dict[str, Mapping[str, Any]] = {}
-    for chunk in _chunks(arns, REVISIONS_BATCH_SIZE):
-        response = describe(**{arns_param: list(chunk)})
-        for item in _described(response, key, arn_key, chunk, what):
-            items[item[arn_key]] = item
     return items
 
 
