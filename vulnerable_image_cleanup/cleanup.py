@@ -30,10 +30,11 @@ LOG.setLevel(logging.INFO)
 # Throttling and transient errors are retried; once the retries run out, the error fails the run.
 BOTO_CONFIG = Config(retries={"mode": "standard", "max_attempts": 10})
 # BatchGetImage and BatchDeleteImage take at most 100 image ids; ECS's DescribeTasks 100 tasks, DescribeServices 10
-# services.
+# services, DescribeServiceDeployments and DescribeServiceRevisions 20 ARNs.
 BATCH_SIZE = 100
 TASKS_BATCH_SIZE = 100
 SERVICES_BATCH_SIZE = 10
+REVISIONS_BATCH_SIZE = 20
 ACCEPTED_MEDIA_TYPES = [
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -48,7 +49,22 @@ REQUIRED_MODEL_FIELDS = {
     ("ecr", "DescribeImagesFilter"): ("imageStatus",),
     ("ecr", "ImageDetail"): ("imageStatus", "lastRecordedPullTime"),
     ("ecs", "Container"): ("image", "imageDigest"),
-    ("ecs", "Service"): ("deployments", "taskSets", "taskDefinition"),
+    ("ecs", "Service"): (
+        "deployments",
+        "taskSets",
+        "taskDefinition",
+        "deploymentController",
+        "currentServiceDeployment",
+        "currentServiceRevisions",
+    ),
+    ("ecs", "ServiceDeployment"): (
+        "targetServiceRevision",
+        "sourceServiceRevisions",
+        "rollback",
+    ),
+    ("ecs", "ServiceRevision"): ("containerImages", "taskDefinition"),
+    ("ecs", "ContainerImage"): ("image", "imageDigest"),
+    ("ecs", "ContainerDefinition"): ("image", "versionConsistency"),
     ("lambda", "FunctionConfiguration"): ("PackageType", "Version"),
     ("lambda", "FunctionCodeLocation"): ("ImageUri", "ResolvedImageUri"),
 }
@@ -236,7 +252,7 @@ def recheck(
 
 def read_view(settings: Settings, clients: Clients) -> Runtime:
     """
-    Read what can run the repository's images: the repository's policy, ECS and Lambda.
+    Read what can run the repository's images: the repository's and the registry's policies, ECS and Lambda.
 
     :param settings: The job's settings.
     :param clients: The clients.
@@ -244,6 +260,7 @@ def read_view(settings: Settings, clients: Clients) -> Runtime:
     """
     builder = RuntimeBuilder(settings)
     builder.add_repository_policy(read_repository_policy(settings, clients.ecr))
+    builder.add_registry_policy(read_registry_policy(clients.ecr))
     read_ecs(clients.ecs, builder, services=True)
     read_lambda(clients.lambda_, builder)
     return builder.build()
@@ -267,16 +284,32 @@ def read_repository_policy(settings: Settings, ecr: Any) -> Optional[str]:
         raise
 
 
+def read_registry_policy(ecr: Any) -> Optional[str]:
+    """
+    :param ecr: An ECR client in the repository's Region.
+    :return: The registry's policy, which may let another account pull from any repository, or None if it has none.
+    """
+    try:
+        return ecr.get_registry_policy()["policyText"]
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == (
+            "RegistryPolicyNotFoundException"
+        ):
+            return None
+        raise
+
+
 def read_ecs(ecs: Any, builder: RuntimeBuilder, services: bool) -> None:
     """
-    Read every cluster's running tasks, and if asked, every service's deployed task definitions.
+    Read every cluster's running tasks, and if asked, every service's deployed task definitions and the service
+    revisions it runs or may go back to.
 
     :param ecs: An ECS client.
     :param builder: Where the uses go.
     :param services: Read the services too.
-    :raise CleanupError: if ECS doesn't describe a task or service it listed.
+    :raise CleanupError: if ECS doesn't describe a task, service, service deployment or service revision it listed.
     """
-    deployed: Dict[str, List[Tuple[str, Mapping[str, Any]]]] = {}
+    found: List[Tuple[str, Mapping[str, Any]]] = []
     for cluster in _paginate(ecs, "list_clusters", "clusterArns"):
         builder.add_cluster()
         task_arns = _paginate(
@@ -291,19 +324,69 @@ def read_ecs(ecs: Any, builder: RuntimeBuilder, services: bool) -> None:
         service_arns = _paginate(ecs, "list_services", "serviceArns", cluster=cluster)
         for chunk in _chunks(service_arns, SERVICES_BATCH_SIZE):
             response = ecs.describe_services(cluster=cluster, services=list(chunk))
-            for service in _described(
-                response, "services", "serviceArn", chunk, "services"
-            ):
-                builder.add_service()
-                for arn in selection.deployed_task_definitions(service):
-                    deployed.setdefault(arn, []).append((cluster, service))
-    for arn in sorted(deployed):
-        task_definition = ecs.describe_task_definition(taskDefinition=arn)[
+            found.extend(
+                (cluster, service)
+                for service in _described(
+                    response, "services", "serviceArn", chunk, "services"
+                )
+            )
+    # The current deployments of the services whose controller resolves tags: the revisions they replace, and the one
+    # they roll back to.
+    deployments = _describe_all(
+        ecs.describe_service_deployments,
+        "serviceDeploymentArns",
+        "serviceDeployments",
+        "serviceDeploymentArn",
+        sorted(
+            {
+                service["currentServiceDeployment"]
+                for _, service in found
+                if selection.resolves_tags(service)
+                and service.get("currentServiceDeployment")
+            }
+        ),
+        "service deployments",
+    )
+    revision_arns = {
+        service["serviceArn"]: (
+            selection.service_revision_arns(
+                service, deployments.get(service.get("currentServiceDeployment"))
+            )
+            if selection.resolves_tags(service)
+            else []
+        )
+        for _, service in found
+    }
+    revisions = _describe_all(
+        ecs.describe_service_revisions,
+        "serviceRevisionArns",
+        "serviceRevisions",
+        "serviceRevisionArn",
+        sorted({arn for arns in revision_arns.values() for arn in arns}),
+        "service revisions",
+    )
+    task_definitions: Dict[str, Mapping[str, Any]] = {}
+    for arn in sorted(
+        {
+            arn
+            for _, service in found
+            for arn in selection.deployed_task_definitions(service)
+        }
+    ):
+        task_definitions[arn] = ecs.describe_task_definition(taskDefinition=arn)[
             "taskDefinition"
         ]
         builder.add_task_definition()
-        for cluster, service in deployed[arn]:
-            builder.add_deployment(cluster, service, task_definition)
+    for cluster, service in found:
+        builder.add_service(
+            cluster,
+            service,
+            [
+                task_definitions[arn]
+                for arn in selection.deployed_task_definitions(service)
+            ],
+            [revisions[arn] for arn in revision_arns[service["serviceArn"]]],
+        )
 
 
 def read_lambda(lambda_: Any, builder: RuntimeBuilder) -> None:
@@ -549,6 +632,34 @@ def _paginate(client: Any, operation: str, key: str, **params: Any) -> List[Any]
     items: List[Any] = []
     for page in client.get_paginator(operation).paginate(**params):
         items.extend(page[key])
+    return items
+
+
+def _describe_all(
+    describe: Any,
+    arns_param: str,
+    key: str,
+    arn_key: str,
+    arns: Sequence[str],
+    what: str,
+) -> Dict[str, Mapping[str, Any]]:
+    """
+    Describe ECS resources by ARN, ``REVISIONS_BATCH_SIZE`` at a time.
+
+    :param describe: The client's describe method.
+    :param arns_param: Its parameter that takes the ARNs.
+    :param key: Where its answer's items are.
+    :param arn_key: Each item's ARN.
+    :param arns: The ARNs.
+    :param what: What they are, for the error.
+    :return: The items, by ARN.
+    :raise CleanupError: if ECS gives a failure, or leaves one out.
+    """
+    items: Dict[str, Mapping[str, Any]] = {}
+    for chunk in _chunks(arns, REVISIONS_BATCH_SIZE):
+        response = describe(**{arns_param: list(chunk)})
+        for item in _described(response, key, arn_key, chunk, what):
+            items[item[arn_key]] = item
     return items
 
 

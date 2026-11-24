@@ -108,6 +108,7 @@ def test_end_to_end(
             repository_name=REPOSITORY,
             registry_id=registry_id,
             region=aws_region,
+            repository_arn=tf_output["repository_arn"]["value"],
             dry_run=False,
             min_severity="HIGH",
             min_age=timedelta(0),

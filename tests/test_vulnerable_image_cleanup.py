@@ -30,6 +30,7 @@ REGISTRY = "111122223333"
 OTHER_ACCOUNT = "444455556666"
 REPOSITORY = "test-repo"
 REGION = "us-west-2"
+REPOSITORY_ARN = f"arn:aws:ecr:{REGION}:{REGISTRY}:repository/{REPOSITORY}"
 OCI_INDEX = "application/vnd.oci.image.index.v1+json"
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
@@ -101,6 +102,7 @@ def settings(**overrides: Any) -> selection.Settings:
         repository_name=REPOSITORY,
         registry_id=REGISTRY,
         region=REGION,
+        repository_arn=REPOSITORY_ARN,
         dry_run=False,
         min_severity="HIGH",
         min_age=timedelta(days=7),
@@ -149,12 +151,16 @@ class Repo:
         self.manifests: Dict[str, str] = {}
         self.findings: List[Dict[str, Any]] = []
         self.coverage: List[Dict[str, Any]] = []
-        # The repository's policy; None for none.
+        # The repository's and the registry's policies; None for none.
         self.policy: Optional[str] = None
+        self.registry_policy: Optional[str] = None
         # ECS: each cluster's running tasks and services, by the cluster's ARN, and the task definitions by ARN.
         self.tasks: Dict[str, List[Dict[str, Any]]] = {}
         self.services: Dict[str, List[Dict[str, Any]]] = {}
         self.task_definitions: Dict[str, Dict[str, Any]] = {}
+        # ECS's service deployments and service revisions, by ARN.
+        self.service_deployments: Dict[str, Dict[str, Any]] = {}
+        self.service_revisions: Dict[str, Dict[str, Any]] = {}
         # The running tasks the read before deleting shows; None for the same as the first read.
         self.tasks_on_recheck: Optional[Dict[str, List[Dict[str, Any]]]] = None
         # Lambda: every function version, with its code.
@@ -227,6 +233,57 @@ class Repo:
         }
         return arn
 
+    def revision(
+        self,
+        service: str,
+        number: int,
+        task_definition: str,
+        images: Sequence[Tuple[str, Optional[str]]],
+        cluster: str = "prod",
+    ) -> str:
+        """
+        Add a service revision: the task definition it deploys, and for each container the image it names and the
+        digest it resolved, None if it resolved none yet.
+        """
+        arn = ecs_arn("service-revision", f"{cluster}/{service}/{number}")
+        container_images = []
+        for position, (image, image_digest) in enumerate(images):
+            entry = {"containerName": f"container-{position}", "image": image}
+            if image_digest:
+                entry["imageDigest"] = image_digest
+            container_images.append(entry)
+        self.service_revisions[arn] = {
+            "serviceRevisionArn": arn,
+            "serviceArn": ecs_arn("service", f"{cluster}/{service}"),
+            "clusterArn": ecs_arn("cluster", cluster),
+            "taskDefinition": task_definition,
+            "containerImages": container_images,
+        }
+        return arn
+
+    def deployment(
+        self,
+        service: str,
+        target: str,
+        sources: Sequence[str] = (),
+        rollback: Optional[str] = None,
+        cluster: str = "prod",
+    ) -> str:
+        """Add a service deployment from the ``sources`` revisions to the ``target`` one."""
+        arn = ecs_arn("service-deployment", f"{cluster}/{service}/1")
+        deployment: Dict[str, Any] = {
+            "serviceDeploymentArn": arn,
+            "serviceArn": ecs_arn("service", f"{cluster}/{service}"),
+            "clusterArn": ecs_arn("cluster", cluster),
+            "status": "IN_PROGRESS",
+            "targetServiceRevision": {"arn": target},
+            "sourceServiceRevisions": [{"arn": source} for source in sources],
+        }
+        if rollback:
+            deployment["rollback"] = {"serviceRevisionArn": rollback}
+        self.service_deployments[arn] = deployment
+        return arn
+
     def service(
         self,
         name: str,
@@ -234,12 +291,42 @@ class Repo:
         cluster: str = "prod",
         desired: int = 0,
         task_sets: Sequence[Tuple[str, str]] = (),
+        revisions: Optional[Sequence[str]] = None,
+        current_deployment: Optional[str] = None,
+        controller: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Add a service. ``deployments`` and ``task_sets`` are (status, task definition ARN) pairs; the first deployment
-        is the service's own task definition.
+        is the service's own task definition. A service with task sets is CodeDeploy's, unless ``controller`` says.
+
+        Under ECS's controller, ``revisions`` are its current service revisions. None gives it one per PRIMARY or
+        ACTIVE deployment, of its task definition, that has resolved no digest yet: as a service that has started no
+        task shows them.
         """
         arn = self.cluster(cluster)
+        if controller is None and task_sets:
+            controller = "CODE_DEPLOY"
+        if revisions is None:
+            revisions = (
+                [
+                    self.revision(
+                        name,
+                        number,
+                        task_definition,
+                        [
+                            (container["image"], None)
+                            for container in self.task_definitions[task_definition][
+                                "containerDefinitions"
+                            ]
+                        ],
+                        cluster=cluster,
+                    )
+                    for number, (status, task_definition) in enumerate(deployments)
+                    if status in selection.DEPLOYED_STATUSES
+                ]
+                if controller in (None, "ECS")
+                else []
+            )
         service: Dict[str, Any] = {
             "serviceArn": ecs_arn("service", f"{cluster}/{name}"),
             "serviceName": name,
@@ -259,6 +346,20 @@ class Repo:
         }
         if deployments:
             service["taskDefinition"] = deployments[0][1]
+        if controller:
+            service["deploymentController"] = {"type": controller}
+        if revisions:
+            service["currentServiceRevisions"] = [
+                {
+                    "arn": revision,
+                    "requestedTaskCount": desired,
+                    "runningTaskCount": 0,
+                    "pendingTaskCount": 0,
+                }
+                for revision in revisions
+            ]
+        if current_deployment:
+            service["currentServiceDeployment"] = current_deployment
         if task_sets:
             service["taskSets"] = [
                 {
@@ -607,7 +708,26 @@ class Repo:
         self.stub_functions(stubs.lambda_)
 
     def stub_policy(self, ecr_stub: Stubber) -> None:
+        """Answer GetRepositoryPolicy, then GetRegistryPolicy."""
         expected = {"registryId": REGISTRY, "repositoryName": REPOSITORY}
+        self._stub_repository_policy(ecr_stub, expected)
+        if self.registry_policy is None:
+            ecr_stub.add_client_error(
+                "get_registry_policy",
+                service_error_code="RegistryPolicyNotFoundException",
+                http_status_code=400,
+                expected_params={},
+            )
+        else:
+            ecr_stub.add_response(
+                "get_registry_policy",
+                {"registryId": REGISTRY, "policyText": self.registry_policy},
+                {},
+            )
+
+    def _stub_repository_policy(
+        self, ecr_stub: Stubber, expected: Dict[str, Any]
+    ) -> None:
         if self.policy is None:
             ecr_stub.add_client_error(
                 "get_repository_policy",
@@ -667,6 +787,59 @@ class Repo:
                         "failures": [],
                     },
                     {"cluster": cluster, "services": chunk},
+                )
+        if services:
+            self.stub_service_revisions(ecs_stub)
+
+    def stub_service_revisions(self, ecs_stub: Stubber) -> None:
+        """Answer DescribeServiceDeployments, then DescribeServiceRevisions, 20 ARNs a call, in ARN order."""
+        resolving = [
+            service
+            for services in self.services.values()
+            for service in services
+            if selection.resolves_tags(service)
+        ]
+        deployments = sorted(
+            {
+                service["currentServiceDeployment"]
+                for service in resolving
+                if service.get("currentServiceDeployment")
+            }
+        )
+        revisions = sorted(
+            {
+                arn
+                for service in resolving
+                for arn in selection.service_revision_arns(
+                    service,
+                    self.service_deployments.get(
+                        service.get("currentServiceDeployment")
+                    ),
+                )
+            }
+        )
+        for operation, param, key, arns, items in (
+            (
+                "describe_service_deployments",
+                "serviceDeploymentArns",
+                "serviceDeployments",
+                deployments,
+                self.service_deployments,
+            ),
+            (
+                "describe_service_revisions",
+                "serviceRevisionArns",
+                "serviceRevisions",
+                revisions,
+                self.service_revisions,
+            ),
+        ):
+            for start in range(0, len(arns), cleanup.REVISIONS_BATCH_SIZE):
+                chunk = arns[start : start + cleanup.REVISIONS_BATCH_SIZE]
+                ecs_stub.add_response(
+                    operation,
+                    {key: [items[arn] for arn in chunk], "failures": []},
+                    {param: chunk},
                 )
 
     def stub_task_definitions(self, ecs_stub: Stubber) -> None:
@@ -1821,6 +1994,7 @@ def environment(**overrides: str) -> Dict[str, str]:
         "REPOSITORY_NAME": REPOSITORY,
         "REGISTRY_ID": REGISTRY,
         "REPOSITORY_REGION": REGION,
+        "REPOSITORY_ARN": REPOSITORY_ARN,
         "DRY_RUN": "true",
         "MIN_SEVERITY": "HIGH",
         "MIN_AGE_DAYS": "7",
@@ -1858,6 +2032,7 @@ def test_settings_from_the_environment():
         {"ROLLBACK_CANDIDATE_RETAIN_COUNT": '"3"'},
         {"REGISTRY_ID": "12345"},
         {"REPOSITORY_REGION": "Oregon"},
+        {"REPOSITORY_ARN": f"arn:aws:ecr:{REGION}:{REGISTRY}:repository/another-repo"},
     ],
 )
 def test_wrong_settings_fail_the_run(overrides):
@@ -1886,7 +2061,10 @@ def test_the_handler_reads_in_the_repository_region(monkeypatch):
         return {}
 
     monkeypatch.setattr(cleanup, "run", run)
-    for name, value in environment(REPOSITORY_REGION="eu-central-1").items():
+    for name, value in environment(
+        REPOSITORY_REGION="eu-central-1",
+        REPOSITORY_ARN=f"arn:aws:ecr:eu-central-1:{REGISTRY}:repository/{REPOSITORY}",
+    ).items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     cleanup.lambda_handler({}, None)
@@ -2245,6 +2423,7 @@ def test_the_summary_counts_what_each_source_shows_in_use():
         "ecs_clusters": 1,
         "ecs_running_tasks": 2,
         "ecs_services": 0,
+        "ecs_service_revisions": 0,
         "ecs_task_definitions": 0,
         "lambda_image_versions": 1,
     }
@@ -2513,11 +2692,14 @@ def test_a_policy_that_isnt_a_json_object_fails_the_run(text):
 # next page's token out of one call and into the next.
 VIEW_READS = {
     "get_repository_policy": ("ecr", None),
+    "get_registry_policy": ("ecr", None),
     "list_clusters": ("ecs", ("clusterArns", "nextToken", "nextToken")),
     "list_tasks": ("ecs", ("taskArns", "nextToken", "nextToken")),
     "describe_tasks": ("ecs", None),
     "list_services": ("ecs", ("serviceArns", "nextToken", "nextToken")),
     "describe_services": ("ecs", None),
+    "describe_service_deployments": ("ecs", None),
+    "describe_service_revisions": ("ecs", None),
     "describe_task_definition": ("ecs", None),
     "list_functions": ("lambda_", ("Functions", "NextMarker", "Marker")),
     "get_function": ("lambda_", None),
@@ -2530,7 +2712,14 @@ def a_repository_ecs_and_lambda_run() -> Tuple[Repo, Dict[str, str]]:
     made = pulled_long_ago(repo, "old", tags=["abc"], pushed=40)
     running = pulled_long_ago(repo, "running", tags=["def"])
     repo.task(None, running["index"])
-    repo.service("web", [("PRIMARY", repo.task_definition("web:1", uri("def")))])
+    web = repo.task_definition("web:1", uri("def"))
+    revision = repo.revision("web", 1, web, [(uri("def"), running["index"])])
+    repo.service(
+        "web",
+        [("PRIMARY", web)],
+        revisions=[revision],
+        current_deployment=repo.deployment("web", revision),
+    )
     repo.function("fn", "1", resolved=uri(image_digest=running["platform"]))
     return repo, made
 
@@ -2627,15 +2816,20 @@ def test_a_failed_read_of_the_view_deletes_nothing(operation, page, code):
         stubs.assert_no_pending_responses()
 
 
-@pytest.mark.parametrize("operation", ["describe_tasks", "describe_services"])
+# What each ECS describe answers with: where its items are, and each item's ARN.
+ECS_DESCRIBES = {
+    "describe_tasks": ("tasks", "taskArn"),
+    "describe_services": ("services", "serviceArn"),
+    "describe_service_deployments": ("serviceDeployments", "serviceDeploymentArn"),
+    "describe_service_revisions": ("serviceRevisions", "serviceRevisionArn"),
+}
+
+
+@pytest.mark.parametrize("operation", ECS_DESCRIBES)
 @pytest.mark.parametrize("answer", ["failure", "left-out"])
 def test_ecs_not_describing_what_it_listed_fails_the_run(operation, answer):
     repo, _ = a_repository_ecs_and_lambda_run()
-    key, arn_key = (
-        ("tasks", "taskArn")
-        if operation == "describe_tasks"
-        else ("services", "serviceArn")
-    )
+    key, arn_key = ECS_DESCRIBES[operation]
     with Stubs() as stubs:
 
         class Answering:
@@ -2770,3 +2964,236 @@ def test_a_lambda_version_without_a_resolved_digest_keeps_what_its_uri_names():
     pulled_long_ago(repo, "old", tags=["v1"])
     repo.function("fn", "1", image_uri=uri("v1"))
     assert repo.run()["protected"]["in_use"] == 1
+
+
+# --- What a service's deployments resolved: version consistency ---
+
+
+@pytest.mark.parametrize("resolved", ["index", "platform", None])
+def test_a_service_keeps_the_digest_its_deployment_resolved_though_the_tag_moved(
+    resolved, caplog
+):
+    # The deployment resolved abc to D1 when it started its first task; abc has moved to D2 since. Scaled to zero, the
+    # service starts D1 again when it scales up. A deployment that resolved nothing yet starts what abc names then.
+    repo = Repo()
+    d1 = pulled_long_ago(repo, "d1", pushed=40)
+    pulled_long_ago(repo, "d2", tags=["abc"])
+    web = repo.task_definition("web:4", uri("abc"))
+    revision = repo.revision("web", 1, web, [(uri("abc"), d1.get(resolved))])
+    repo.service("web", [("PRIMARY", web)], desired=0, revisions=[revision])
+    with caplog.at_level("INFO"):
+        summary = repo.run(
+            deletions=[] if resolved else deletes(d1),
+            recheck=None if resolved else [d1["platform"]],
+        )
+    assert summary["deleted"] == int(resolved is None)
+    assert summary["view"]["ecs_service_revisions"] == 1
+    assert summary["view"]["complete"] is True
+    if resolved:
+        lines = {line["digests"][0]: line for line in image_lines(caplog)}
+        assert lines[d1["index"]]["in_use_by"] == [
+            {
+                "source": "ecs",
+                "via": "deployment",
+                "cluster": "prod",
+                "service": "web",
+                "task_definition": "web:4",
+            }
+        ]
+
+
+@pytest.mark.parametrize("how", ["source", "rollback"])
+def test_the_revision_a_deployment_replaces_or_rolls_back_to_keeps_its_digest(how):
+    # Mid-deployment, or rolling back, with every task of the old revision gone: a rollback starts its digest.
+    repo = Repo()
+    old = pulled_long_ago(repo, "old", pushed=40)
+    new = pulled_long_ago(repo, "new", tags=["abc"])
+    web_1 = repo.task_definition("web:1", uri("abc"))
+    web_2 = repo.task_definition("web:2", uri("abc"))
+    old_revision = repo.revision("web", 1, web_1, [(uri("abc"), old["index"])])
+    new_revision = repo.revision("web", 2, web_2, [(uri("abc"), new["index"])])
+    deployment = repo.deployment(
+        "web",
+        new_revision,
+        sources=[old_revision] if how == "source" else [],
+        rollback=old_revision if how == "rollback" else None,
+    )
+    repo.service(
+        "web",
+        [("PRIMARY", web_2)],
+        revisions=[new_revision],
+        current_deployment=deployment,
+    )
+    summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["protected"]["in_use"] == 2
+    assert summary["view"]["ecs_service_revisions"] == 2
+
+
+def test_revisions_are_read_20_at_a_time():
+    repo = Repo()
+    made = pulled_long_ago(repo, "old")
+    for number in range(21):
+        web = repo.task_definition(f"web-{number:02}:1", uri("other"))
+        revision = repo.revision(
+            f"web-{number:02}",
+            1,
+            web,
+            [(uri("other"), made["index"] if number == 20 else digest(f"x{number}"))],
+        )
+        repo.service(f"web-{number:02}", [("PRIMARY", web)], revisions=[revision])
+    summary = repo.run()
+    assert summary["protected"]["in_use"] == 1
+    assert summary["view"]["ecs_service_revisions"] == 21
+
+
+@pytest.mark.parametrize(
+    "image, version_consistency, controller, complete",
+    [
+        (uri("abc"), None, None, False),
+        (uri("abc"), "enabled", "ECS", False),
+        (uri("abc"), "disabled", None, True),
+        (uri(image_digest=digest("pinned")), None, None, True),
+        (uri("abc", repository="other-repo"), None, None, True),
+        (uri("abc"), None, "CODE_DEPLOY", True),
+        (uri("abc"), None, "EXTERNAL", True),
+    ],
+    ids=[
+        "by-tag",
+        "by-tag-consistency-on",
+        "consistency-off",
+        "by-digest",
+        "another-repository",
+        "code-deploy",
+        "external",
+    ],
+)
+def test_a_service_without_a_revision(image, version_consistency, controller, complete):
+    # Under ECS's controller, a service that shows no revision may run the digest an old deployment resolved its tag
+    # to, which the job can't see. With version consistency off, or another controller, a tag names what starts.
+    repo = Repo()
+    old = pulled_long_ago(repo, "old", pushed=40)
+    pulled_long_ago(repo, "new", tags=["abc"])
+    web = repo.task_definition("web:1", image)
+    if version_consistency:
+        repo.task_definitions[web]["containerDefinitions"][0][
+            "versionConsistency"
+        ] = version_consistency
+    repo.service("web", [("PRIMARY", web)], revisions=[], controller=controller)
+    # The image the tag names now is retained, so only the old one can be a candidate.
+    summary = repo.run(
+        deletions=deletes(old) if complete else [],
+        recheck=[old["platform"]] if complete else None,
+        retain_tags=frozenset({"abc"}),
+    )
+    assert summary["view"]["complete"] is complete
+    assert summary["deleted"] == int(complete)
+    if not complete:
+        assert summary["view"]["incomplete_because"] == [
+            "ECS service prod/web shows no service revision, so not the digest its tag abc resolved to"
+        ]
+        assert summary["protected"]["in_use_unknown"] == 1
+
+
+# --- The registry's policy ---
+
+
+@pytest.mark.parametrize(
+    "resource",
+    [
+        {"Resource": f"arn:aws:ecr:{REGION}:{REGISTRY}:repository/*"},
+        {"Resource": "*"},
+        {"Resource": [f"arn:aws:ecr:*:{REGISTRY}:repository/other", REPOSITORY_ARN]},
+        {"Resource": REPOSITORY_ARN.upper()},
+        {"Resource": f"arn:aws:ecr:{REGION}:{REGISTRY}:repository/test-*"},
+        {"NotResource": f"arn:aws:ecr:{REGION}:{REGISTRY}:repository/other"},
+        {},
+    ],
+    ids=[
+        "every-repository",
+        "star",
+        "this-one-among-others",
+        "any-case",
+        "a-prefix",
+        "not-resource-of-another",
+        "no-resource",
+    ],
+)
+def test_a_registry_policy_that_lets_another_account_pull_here(resource):
+    statement = dict(
+        pull_statement({"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:root"}), **resource
+    )
+    assert selection.registry_policy_gaps(
+        policy(statement), REGISTRY, REPOSITORY_ARN
+    ) == [f"registry policy allows account {OTHER_ACCOUNT}"]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        {
+            "Sid": "Replication",
+            "Effect": "Allow",
+            "Principal": {"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:root"},
+            "Action": ["ecr:ReplicateImage", "ecr:CreateRepository"],
+            "Resource": f"arn:aws:ecr:{REGION}:{REGISTRY}:repository/*",
+        },
+        dict(
+            pull_statement({"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:root"}),
+            Resource=f"arn:aws:ecr:{REGION}:{REGISTRY}:repository/other",
+        ),
+        dict(
+            pull_statement({"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:root"}),
+            NotResource=REPOSITORY_ARN,
+        ),
+        dict(
+            pull_statement({"AWS": f"arn:aws:iam::{REGISTRY}:root"}),
+            Resource="*",
+        ),
+    ],
+    ids=["replication-only", "another-repository", "not-this-one", "this-account"],
+)
+def test_a_registry_policy_that_lets_no_one_outside_pull_here(statement):
+    assert (
+        selection.registry_policy_gaps(policy(statement), REGISTRY, REPOSITORY_ARN)
+        == []
+    )
+
+
+def test_no_registry_policy_lets_no_one_outside_pull():
+    assert selection.registry_policy_gaps(None, REGISTRY, REPOSITORY_ARN) == []
+
+
+@pytest.mark.parametrize("registry", ["pull", "replication"])
+def test_a_registry_policy_decides_the_view(registry):
+    # A registry statement that lets another account pull from every repository keeps an image pulled before the
+    # soak; one for replication only doesn't.
+    repo = Repo()
+    made = pulled_long_ago(repo, "old", tags=["abc"])
+    actions = PULL_ACTIONS if registry == "pull" else ["ecr:ReplicateImage"]
+    repo.registry_policy = policy(
+        {
+            "Sid": "AnotherAccount",
+            "Effect": "Allow",
+            "Principal": {"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:root"},
+            "Action": actions,
+            "Resource": f"arn:aws:ecr:{REGION}:{REGISTRY}:repository/*",
+        }
+    )
+    pulled = registry == "pull"
+    summary = repo.run(
+        deletions=[] if pulled else deletes(made),
+        recheck=None if pulled else [made["platform"]],
+    )
+    assert summary["deleted"] == int(not pulled)
+    assert summary["view"]["complete"] is (not pulled)
+    if pulled:
+        assert summary["view"]["incomplete_because"] == [
+            f"registry policy allows account {OTHER_ACCOUNT}"
+        ]
+        assert summary["protected"]["in_use_unknown"] == 1
+
+
+def test_a_registry_policy_that_isnt_json_fails_the_run():
+    with pytest.raises(selection.RepositoryError, match="registry policy"):
+        selection.registry_policy_gaps("not json", REGISTRY, REPOSITORY_ARN)
