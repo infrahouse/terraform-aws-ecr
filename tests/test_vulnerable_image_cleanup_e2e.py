@@ -14,8 +14,9 @@ image.
 4. ECR's pull record: the reads of the indexes, the test's with the function's code and the function's, show as pulls
    of the indexes. Neither they nor Inspector's scans show as a pull of a platform image.
 5. The function's code, from the test, with the least age at 0, reads Inspector's real coverage, which has no in-use
-   data, and ECR's pull record, and reads the images it judged never pulled again before deleting. It deletes the
-   never-pulled candidate whole and the alias index alone, and keeps the retained image and the pulled one.
+   data, ECR's pull record, and what ECS and Lambda run, and reads the candidates' pull records and the running tasks
+   again before deleting. It deletes the never-pulled candidate whole and the alias index alone, and keeps the
+   retained image and the pulled one.
 
 Step 5 stands in for the deployed function a week later: the module won't take a least age under a day.
 """
@@ -106,6 +107,7 @@ def test_end_to_end(
         settings = selection.Settings(
             repository_name=REPOSITORY,
             registry_id=registry_id,
+            region=aws_region,
             dry_run=False,
             min_severity="HIGH",
             min_age=timedelta(0),
@@ -210,6 +212,7 @@ def test_end_to_end(
         assert payload["protected"]["recent"] == 4
         assert payload["protected"]["in_use"] == 1
         assert payload["judged_never_pulled"] == 3
+        assert payload["view"]["complete"] is True, payload["view"]
         assert payload["deleted"] == 0
         assert list_digests(ecr, REPOSITORY) == before
 
@@ -241,8 +244,14 @@ def test_end_to_end(
         LOG.info(
             "Inspector's coverage: %s", json.dumps(coverage, default=str, indent=4)
         )
-        cleanup.check_models(ecr, inspector)
-        plan = cleanup.decide(settings, ecr, inspector, datetime.now(timezone.utc))
+        clients = cleanup.Clients(
+            ecr=ecr,
+            inspector=inspector,
+            ecs=boto3_session.client("ecs", region_name=aws_region),
+            lambda_=lambda_client,
+        )
+        cleanup.check_models(clients)
+        plan = cleanup.decide(settings, clients, datetime.now(timezone.utc))
         verdicts = {verdict.unit.root: verdict for verdict in plan.verdicts}
         for root in (candidate["index"], alias):
             # Judged from ECR's pull record: Inspector gives no in-use data on an image it never saw in use.
@@ -252,8 +261,9 @@ def test_end_to_end(
         assert selection.RETAINED_TAG in verdicts[pinned["index"]].reasons
         assert verdicts[pulled["index"]].reasons == {selection.IN_USE}
         assert not verdicts[pulled["index"]].never_pulled
-        # The reads again, of the candidate's and the alias's platform images, find no pull.
+        # The reads again, of the candidate's and the alias's platform images, find no pull, and no task runs them.
         assert plan.pulled_on_recheck == ()
+        assert plan.dropped_on_recheck == ()
         summary = cleanup.execute(settings, ecr, plan)
         LOG.info(json.dumps(summary, indent=4))
         # The candidate, and the alias index alone.
