@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-11-24
+
+### Documentation
+
+- What the cleanup sees, and what it doesn't
+- Resolved digests, the registry policy, and what else isn't seen
+
+### Features
+
+- Judge use by what ECS and Lambda run, and the repository policy
+- Let the cleanup's role read ECS, Lambda and the repository policy
+- Keep the digest an ECS deployment resolved, and read the registry policy
+
+### Testing
+
+- The dry run reads ECS and Lambda, and sees another account
+
 ## [1.0.2] - 2026-11-24
 
 ### Documentation
