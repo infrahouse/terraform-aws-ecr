@@ -1,116 +1,72 @@
-# terraform-aws-ecr
+# InfraHouse ECR
 
-Module that creates a container registry (AWS ECR service).
+This Terraform module creates an Amazon ECR repository with a lifecycle policy that expires old images and keeps the
+ones you still need: your last deployments, kept as rollback candidates, and the images something pins by tag. An
+opt-in scheduled job deletes the images Amazon Inspector reports vulnerable that nothing protects.
 
-It needs Terraform 1.9 or later, AWS provider 6.0 or later (below 7.0), and the `null` and `time` providers.
-The vulnerable image cleanup below runs as
-[terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored), which needs this
-floor (its S3 bucket comes from terraform-aws-s3-bucket, which needs AWS provider 6.0), and Terraform installs a
-module's providers whether the module is used or not: the floor applies to every caller, with the cleanup on or off.
-A caller on AWS provider 5 upgrades to 6 before taking this release.
+![Architecture](assets/architecture.png)
 
-## Vulnerable image cleanup
+## Why This Module?
 
-Amazon Inspector reports a vulnerability in every image it still monitors, used or not. The cleanup is an opt-in
-scheduled Lambda that deletes the images Inspector reports vulnerable, so old images stop carrying reports long after
-a fixed image runs.
+A repository takes a few lines of Terraform. A lifecycle policy that never expires an image something still runs takes
+more care: ECR applies the rules by priority, a rule can't expire an image that a higher-priority rule selects but
+still counts it, and some combinations of rules ECR refuses only at apply. The module writes the policy from a few
+inputs, in an order that protects what runs:
 
-It is off by default: with `vulnerable_image_cleanup_enabled = false` it creates nothing.
+- **Rollback candidates.** The images your deployments tagged `deployed-at-*` get rules of their own, ahead of the
+  tagged-image rules, so the last N deployments stay however old they are and however many images CI pushes after
+  them.
+- **Retained tags.** Each tag in `retain_tags` gets a rule at the first priorities that keeps the one image carrying
+  it. The image a scheduled task pins can't be expired by any other rule, even once it was deployed and carries a
+  `deployed-at-*` tag.
+- **The rule order, computed.** Retained tags first, then rollback candidates, then tagged images, then untagged ones.
+  Add a retained tag, and the other rules move down without renumbering.
+- **Vulnerable image cleanup.** Inspector reports vulnerabilities in every image it monitors, used or not. A daily
+  Lambda deletes the vulnerable images that nothing protects. It keeps what the lifecycle policy keeps, what runs or
+  ran recently, what was pushed recently, and anything whose use it can't judge. It runs dry until you turn deletion
+  on, and fails closed.
 
-### What it deletes
+The module creates the repository and its lifecycle policy, and the cleanup when it is on. It sets no repository
+policy, replication, scanning or encryption options.
 
-An image with an ACTIVE Inspector finding at or above `vulnerable_image_cleanup_min_severity` (default `HIGH`) that
-has a fix available, when nothing protects it. An image index goes with the manifests it references (its platform
-images and its attestation) and counts as one image: the index first, then the manifests no other index references.
+## Features
 
-### What it keeps
+- **ECR repository** tagged with `environment`, `service`, `created_by_module` and `module_version`.
+- **Count- and age-based expiry** of tagged images, filtered by tag prefix or pattern, and of untagged images.
+- **Rollback candidate retention**: keep the newest N images, or those within N days, with the tag prefix that the
+  InfraHouse [ECS module](https://github.com/infrahouse/terraform-aws-ecs) adds after a successful deployment.
+- **Retained tags**: exact tags whose images no other rule expires and the cleanup never deletes.
+- **Vulnerable image cleanup**, off by default and dry when on: a scheduled Lambda, monitored by
+  [terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored), with alarm emails
+  and JSON logs of every decision.
+- **Terraform 1.9 or later and AWS provider 6** (`>= 6.0, < 7.0`).
 
-An image is protected when any of these hold:
-
-- it carries a tag in `retain_tags`;
-- it is a rollback candidate the lifecycle policy keeps (the same tag prefix, count and days as its rules; a retained
-  image counts toward the count), while `vulnerable_image_cleanup_protect_rollback_candidates` is true;
-- it is in use, or was used within `vulnerable_image_cleanup_soak_days`, by Inspector's `inUseCount` and
-  `lastInUseAt`; or ECR's `lastRecordedPullTime` says its platform image, or a single-manifest image, was pulled within
-  the soak;
-- it was pushed within `vulnerable_image_cleanup_min_age_days`;
-- it is archived;
-- the job can't tell whether it is in use: Inspector gives no in-use data on a platform image or single manifest, and
-  ECR recorded a pull of it before the soak, so a long-running task that pulled it then may still run it; or
-  Inspector gives only part of its in-use data; or Inspector gives no in-use data on it, ECR has no pull record of it,
-  and it was pushed before 2022-03-03: AWS released ECR's pull time on 2022-03-02, so it may have been pulled without
-  a record.
-
-A protected index protects every manifest it references. When the job can't judge, it deletes nothing: an API error,
-throttling that outlasts the retries, or a page it can't read fails the run, and the Lambda's alarm emails
-`vulnerable_image_cleanup_alarm_emails`.
-
-### How it judges use
-
-From Inspector's in-use data when Inspector gives it. Inspector leaves `inUseCount` and `lastInUseAt` out for an
-image it has never seen in use, and some accounts get them for no image at all.
-
-Otherwise from ECR's pull record. A container runtime pulls an image to run it, and ECR records the pull on the
-platform image it fetched. So an image none of whose platform images (or, for a single-manifest image, the manifest)
-ECR ever recorded a pull of was never run: the job judges it not in use, and deletes it if nothing else protects it.
-That holds for an image pushed from 2022-03-03; an older one without a pull record is kept, as above.
-
-One answer without a pull time isn't enough to delete. After a first pull shows, ECR's answers flap for about five
-minutes: one read shows the pull, the next may not. So before it deletes, or in a dry run logs, the job reads every
-image it judged never pulled again, 13 times, 10 seconds apart. If any read shows a pull, it judges the image again
-with that pull, and keeps it. Each run logs a `"recheck"` line with what it read again and the pulls it found, and the
-summary counts them (`pulled_on_recheck`).
-
-Inspector's scans record no pull. The job's own reads record one on what they read with BatchGetImage: every index,
-and any manifest whose media type ECR doesn't give. Such a manifest then looks pulled, and is kept.
-
-Only a fetch of a platform image or single manifest counts as a pull. An index's own pull time doesn't count, since
-ECR records the job's read of each index as a pull, and an attestation's doesn't either: a pull that fetches the
-attestation, as `docker pull` may, fetches the platform image too, and a tool such as a scanner may fetch the
-attestation alone. A client that already has the platform image, such as an EKS node or a host that ran the image
-before, may fetch only the index; the pull that brought the platform image to it is on record, and keeps the image.
-
-What ECR's pull record doesn't show, so put every tag something pins in `retain_tags` rather than rely on a pull:
-
-- a first pull within the last day: ECR refreshes the pull time "at least once every 24 hours", so an old image
-  deployed for the first time within the last day, say for a rollback, may not show its pull yet. In the test account
-  a pull showed within a minute, and then flapped for about five minutes; a run in that minute doesn't see it;
-- a pull from elsewhere: ECR records a pull on the image in the repository that served it, so a replica in another
-  Region or account, or the same image pulled from another repository and cached on a host, runs without a pull
-  recorded here;
-- a pull by a principal in the registry's pull-time update exclusions.
-
-### Dry run, and turning deletion on
-
-Turned on, it runs dry: it logs a JSON line per image it would delete, with its digests, tags, push time, last use
-and pull, how its use was judged (`use_judged_by`: `inspector`, `ecr_pull_record` or `unknown`; and `never_pulled`),
-and CVE ids, a line per vulnerable image it keeps, with the reasons, and a summary line, which counts the vulnerable
-images judged never pulled (`judged_never_pulled`). Its role has no
-`ecr:BatchDeleteImage`. Read the dry runs' lines in the function's log group, and once they name only images you can
-do without, set `vulnerable_image_cleanup_dry_run = false`. A run then deletes at most
-`vulnerable_image_cleanup_max_deletions` images (default 10), the oldest first. A deletion that fails part way logs
-a `delete_failed` line naming the image, the digests ECR did delete and the error, and then the run fails.
-
-**A deletion can't be undone.** An image a service still needs and that nothing protects is gone, and that service's
-next task can't start. Put every tag an environment pins in `retain_tags`.
+## Quick Start
 
 ```hcl
-module "my_service_ecr" {
+module "ecr" {
   source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-  version = "..." # the first release with the cleanup, or later
+  version = "1.0.1"
 
-  repo_name    = "my-service-repo"
+  repo_name    = "my-service"
   environment  = "production"
   service_name = "my-service"
 
-  rollback_candidate_retain_count = 3
-  retain_tags                     = [var.migrator_image_tag, var.docker_image_tag]
-
-  vulnerable_image_cleanup_enabled      = true
-  vulnerable_image_cleanup_alarm_emails = ["ops@example.com"]
-  # vulnerable_image_cleanup_dry_run    = false
+  expire_days_tagged    = 365
+  tag_prefix_list       = ["v"]
+  expire_count_untagged = 5
 }
 ```
 
-Turning it on needs `python3`, `pip3`, the AWS CLI and `jq` where Terraform runs: terraform-aws-lambda-monitored
-builds the function's package there.
+Tagged images whose tag starts with `v` expire a year after they were pushed, and the 5 newest untagged images stay.
+The module needs at least one lifecycle rule. [Getting Started](getting-started.md) goes through the prerequisites
+and a first deployment.
+
+## Documentation
+
+- [Getting Started](getting-started.md): prerequisites and a first deployment
+- [Architecture](architecture.md): the repository, how ECR applies the lifecycle rules, and the cleanup
+- [Configuration](configuration.md): every input, and when to change it
+- [Examples](examples.md): common uses, each a complete root module in the repository
+- [Troubleshooting](troubleshooting.md): errors at plan and apply, and what the cleanup's logs say
+- [Changelog](changelog.md): every change, release by release
