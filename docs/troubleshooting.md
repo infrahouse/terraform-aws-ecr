@@ -19,7 +19,7 @@ the vulnerable image cleanup is on or off: Terraform installs a module's provide
 dependencies need AWS provider 6.0.
 
 Upgrade the root module to AWS provider 6 (`version = "~> 6.0"`), then run `terraform init -upgrade`. The module
-also needs Terraform 1.9 or later: an older Terraform stops with `Unsupported Terraform Core version`.
+also needs Terraform 1.9 or later, below 2.0: another version stops with `Unsupported Terraform Core version`.
 
 ### `terraform plan` Fails with `Invalid Block`
 

@@ -7,7 +7,9 @@ and deletes nothing.
 ## What This Example Creates
 
 - An ECR repository and its lifecycle policy: the retained images, the 5 newest rollback candidates, and the 30 newest
-  tagged images are kept
+  tagged images are kept, and untagged images expire after 7 days. The cleanup protects the retained images and the
+  rollback candidates; a vulnerable image among the 30 newest tagged images is deleted unless something else protects
+  it
 - A Lambda function, `<repo_name>-<hash>-vuln-cleanup`, built and monitored by
   [terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored): its log group,
   `/aws/lambda/<function name>`, kept 365 days, and error and throttle alarms that email `alarm_emails`

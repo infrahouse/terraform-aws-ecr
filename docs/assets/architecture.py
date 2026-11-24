@@ -120,7 +120,7 @@ def cleanup_run() -> None:
             "\n5. Log JSON lines\nwould_delete or deleted,\nkept, left_by_cap, summary"
         )
         alarm = CloudwatchAlarm(
-            "\nError alarm\nany error fails the run\nbefore it deletes"
+            "\nError alarm\nany error fails the run;\na read error, before\nit deletes anything"
         )
 
         schedule >> Edge(label="1. invoke") >> function
