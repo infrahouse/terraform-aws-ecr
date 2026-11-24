@@ -35,9 +35,9 @@ The cleanup keeps what runs. What it sees, in the repository's account and Regio
 
 - **Inspector's in-use data.**
 - **ECR's pull record.**
-- **ECS's running tasks and services:** every cluster's running tasks, and the task definitions of every service's
-  PRIMARY and ACTIVE deployments and task sets, so a service scaled to zero, mid-deployment or rolling back is
-  seen.
+- **ECS's running tasks and services:** every cluster's running tasks; the digests every service's revisions resolved
+  its tags to, those its current deployment replaces or rolls back to included; and the task definitions of its
+  PRIMARY and ACTIVE deployments and task sets. So a service scaled to zero, mid-deployment or rolling back is seen.
 - **Lambda's versions:** every version of every container image function, not only `$LATEST`.
 
 What it doesn't see:
@@ -46,14 +46,15 @@ What it doesn't see:
 - Docker run directly on EC2;
 - an ECS task started by a schedule or by hand, outside a service (it sees one only while it runs);
 - CodeBuild and App Runner;
-- other Regions.
+- other Regions;
+- anything else in the account that pulls from ECR, such as AWS Batch or SageMaker.
 
 What to do about it: put any tag such a thing pins in `retain_tags`.
 
-**Other accounts:** the job detects them through the repository policy, and keeps pulled images. An image ECR recorded
-a pull of before the soak, that nothing in ECS or Lambda runs, is deleted only when the repository's policy lets no
-one outside the account pull. Something outside the account that pulls with a role of this account looks like this
-account to the policy: put the tags it pins in `retain_tags` too.
+**Other accounts:** the job detects them through the repository's and the registry's policies, and keeps pulled
+images. An image ECR recorded a pull of before the soak, that nothing in ECS or Lambda runs, is deleted only when
+neither policy lets anyone outside the account pull from this repository. Something outside the account that pulls
+with a role of this account looks like this account to the policies: put the tags it pins in `retain_tags` too.
 
 ## Features
 
