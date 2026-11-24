@@ -68,8 +68,10 @@ are defined in `locals.tf` and merged onto the ECR repository.
   reads ECR (every image, every index's manifest, the repository's and
   the registry's policies), Inspector (findings, coverage), ECS (every
   cluster's running tasks; every service's deployed task definitions,
-  current deployment and service revisions) and Lambda (every version
-  of every container image function); decides; reads again
+  current deployment and service revisions, each service's in requests
+  of their own, as ECS refuses a DescribeServiceDeployments or
+  DescribeServiceRevisions request across services) and Lambda (every
+  version of every container image function); decides; reads again
   the candidates' pull records and the running tasks (`recheck`); then
   deletes or, dry, only logs.
 - **vulnerable_image_cleanup/selection.py**: the rules, as pure Python
@@ -197,14 +199,18 @@ The vulnerable image cleanup's tests:
 - `tests/test_vulnerable_image_cleanup.py`: unit tests, no AWS. Run them
   with plain `pytest tests/test_vulnerable_image_cleanup.py`. botocore's
   Stubber serves model-checked answers and fails any unexpected call,
-  such as a delete in a dry run.
+  such as a delete in a dry run. It checks a request's shape, not ECS's
+  rules: the tests' ECS client refuses a DescribeServiceDeployments or
+  DescribeServiceRevisions request across services, as ECS does.
 - `tests/test_vulnerable_image_cleanup_dry_run.py`
   (`test_data/vulnerable_image_cleanup_dry_run/`): on and dry, a
-  repository with nothing vulnerable, an ECS service scaled to zero
-  naming an image by tag, and a container image function the test makes
-  (version 1 and `$LATEST` on two images); checks the deployed function
-  reads ECS (the service's revision included) and Lambda under its role
-  and sees both, that a repository
+  repository with nothing vulnerable, two ECS services scaled to zero
+  each naming an image by tag, and a container image function the test
+  makes (version 1 and `$LATEST` on two images); checks the deployed
+  function reads ECS (both services' revisions included) and Lambda
+  under its role and sees both; reads both services' deployments with
+  the function's code, as they show no current deployment for the
+  function to read; checks that a repository
   policy letting another account pull makes the view incomplete, the
   role's policies (DescribeTasks's scope through IAM's simulator, as no
   task runs), and that the function's reads record a pull of the
