@@ -46,7 +46,7 @@ policy, replication, scanning or encryption options.
 ```hcl
 module "ecr" {
   source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-  version = "1.0.1"
+  version = "1.0.2"
 
   repo_name    = "my-service"
   environment  = "production"

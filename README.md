@@ -61,7 +61,7 @@ scanning or encryption options.
 ```hcl
 module "foo_ecr" {
     source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-    version = "1.0.1"
+    version = "1.0.2"
 
     repo_name             = "test_repo"
     environment           = "development"
@@ -130,7 +130,7 @@ it isn't the one deployed, and once it was deployed it carries a
 ```hcl
 module "my_service_ecr" {
     source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-    version = "1.0.1"
+    version = "1.0.2"
 
     repo_name    = "my-service-repo"
     environment  = "production"
@@ -171,7 +171,7 @@ after a successful deployment, the ECS module adds a
 ```hcl
 module "my_service_ecr" {
     source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-    version = "1.0.1"
+    version = "1.0.2"
 
     repo_name    = "my-service-repo"
     environment  = "production"
@@ -253,7 +253,7 @@ It is off by default, and creates nothing until
 ```hcl
 module "my_service_ecr" {
     source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-    version = "1.0.1"
+    version = "1.0.2"
 
     repo_name    = "my-service-repo"
     environment  = "production"
