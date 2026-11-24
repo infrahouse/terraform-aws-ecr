@@ -163,11 +163,15 @@ variable "vulnerable_image_cleanup_enabled" {
     reports vulnerable, at or above vulnerable_image_cleanup_min_severity with a fix available, that nothing
     protects. An image is protected when it carries a tag in retain_tags, is a rollback candidate the
     lifecycle policy keeps, is in use or was within the soak, was pushed within the least age, or when the
-    job can't tell whether it is in use. It judges use from Inspector's in-use data and, without it, from
-    ECR's pull record: an image pushed from 2022-03-03 whose platform images ECR never recorded a pull of was
-    never run, so it isn't in use; an older one without a pull record is kept. ECR refreshes the pull time at
-    least once every 24 hours, and records a pull only in the repository that served it: put every tag
-    something pins in retain_tags. An image index is deleted with the manifests it references.
+    job can't tell whether it is in use. It judges use from what ECS (running tasks, services' deployments)
+    and Lambda (every function version) run in the repository's account and Region, from Inspector's in-use
+    data and, without it, from ECR's pull record: an image pushed from 2022-03-03 whose platform images ECR
+    never recorded a pull of was never run, so it isn't in use; an older one without a pull record is kept.
+    One last pulled before the soak that nothing in ECS or Lambda runs isn't in use when the repository's
+    policy lets no one outside the account pull, and is kept otherwise. It doesn't see EKS, Docker run on
+    EC2, an ECS task outside a service unless it is running, CodeBuild, App Runner or other Regions, and ECR
+    refreshes the pull time at least once every 24 hours: put every tag something pins in retain_tags. An
+    image index is deleted with the manifests it references.
     Turned on, it runs dry until vulnerable_image_cleanup_dry_run is false. A deletion can't be undone.
     Off by default: false creates nothing.
   EOT
@@ -252,10 +256,12 @@ variable "vulnerable_image_cleanup_soak_days" {
   description = <<-EOT
     An image in use, or used within this many days by Inspector's lastInUseAt, is protected, and so is one whose
     platform image or single manifest ECR's lastRecordedPullTime says was pulled within this many days. Without
-    Inspector's in-use data, one pulled earlier is kept too, as a task that pulled it then may still run it,
-    while one never pulled was never run, and isn't in use. An index's own pull time doesn't count, as ECR records
-    the job's own read of each index as a pull. ECR refreshes the pull time at least once every 24 hours, so a first
-    pull within the last day may not show yet: put a tag something pins in retain_tags rather than rely on a pull.
+    Inspector's in-use data, one pulled earlier that nothing in ECS or Lambda runs isn't in use when the
+    repository's policy lets no one outside the account pull; otherwise it is kept, as a task in another account
+    that pulled it then may still run it. One never pulled was never run, and isn't in use. An index's own pull
+    time doesn't count, as ECR records the job's own read of each index as a pull. ECR refreshes the pull time at
+    least once every 24 hours, so a first pull within the last day may not show yet: put a tag something pins in
+    retain_tags rather than rely on a pull.
   EOT
   type        = number
   default     = 2

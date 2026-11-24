@@ -108,10 +108,14 @@ Each run logs JSON lines, one per image, with `"action"`: `would_delete` or `del
 Read the `summary` line:
 
 ```json
-{"summary": {"candidates": 0, "deleted": 0, "dry_run": true, "images_seen": 42, "judged_never_pulled": 0,
- "left_by_cap": 0, "manifests_seen": 120, "protected": {"in_use": 3, "in_use_unknown": 9, "not_active": 0,
- "recent": 2, "retained_tag": 1, "rollback_candidate": 5}, "pulled_on_recheck": 0, "repository": "my-service",
- "vulnerable": 14, "would_delete": 0}}
+{"summary": {"candidates": 0, "deleted": 0, "dropped_on_recheck": 0, "dry_run": true,
+ "images_in_use_by": {"ecr_pull_record": 1, "ecs": 3, "inspector": 0, "lambda": 0}, "images_seen": 42,
+ "judged_never_pulled": 0, "left_by_cap": 0, "manifests_seen": 120, "protected": {"in_use": 3,
+ "in_use_unknown": 9, "not_active": 0, "recent": 2, "retained_tag": 1, "rollback_candidate": 5},
+ "pulled_on_recheck": 0, "repository": "my-service",
+ "view": {"complete": false, "ecs_clusters": 2, "ecs_running_tasks": 6, "ecs_services": 3,
+ "ecs_task_definitions": 4, "incomplete_because": ["repository policy allows account 111122223333"],
+ "lambda_image_versions": 0}, "vulnerable": 14, "would_delete": 0}}
 ```
 
 - **`vulnerable` is 0.** No ACTIVE Inspector finding at or above `vulnerable_image_cleanup_min_severity` with a fix
@@ -124,20 +128,24 @@ Read the `summary` line:
 ### An Image Is Kept as `in_use_unknown`
 
 The cleanup can't tell whether something runs the image, so it keeps it. Its `kept` line says
-`"use_judged_by": "unknown"`. One of its platform images, or the image itself if it is a single manifest, is in one of
-these cases:
+`"use_judged_by": "unknown"`. Nothing in ECS or Lambda runs it, and one of its platform images, or the image itself if
+it is a single manifest, is in one of these cases:
 
-- **Inspector gives no in-use data on it, and ECR recorded a pull before the soak.** `last_pulled_at` is older than
-  `vulnerable_image_cleanup_soak_days`. A long-running task that pulled it then may still run it, and nothing tells
-  the cleanup otherwise.
+- **Inspector gives no in-use data on it, ECR recorded a pull before the soak, and the view isn't complete.**
+  `last_pulled_at` is older than `vulnerable_image_cleanup_soak_days`, and the summary's `view` says
+  `"complete": false`: `incomplete_because` names who outside the account the repository's policy lets pull, such as
+  `"repository policy allows account 111122223333"`. A long-running task there that pulled it then may still run it,
+  and the cleanup can't see that account. Once the policy lets no one outside the account pull, such an image is
+  deleted, if nothing else protects it.
 - **Inspector gives part of its in-use data:** one of `inUseCount` and `lastInUseAt` without the other, one coverage
   record with both and another without, or in-use data on its findings without a coverage record.
 - **Inspector gives no in-use data, ECR has no pull record, and it was pushed before 2022-03-03.** AWS released ECR's
   pull time on 2022-03-02, so such an image may have been pulled without a record.
 
-Nothing in the module overrides this. The image stays until the lifecycle policy expires it, or until Inspector
-reports its use. If you have made sure that nothing runs it, you can delete it yourself: the index first, then its
-platform images and attestation, with their digests from its `kept` line.
+Nothing in the module overrides this. The image stays until the lifecycle policy expires it, until Inspector
+reports its use, or, for the first case, until the repository's policy lets no one outside the account pull. If you
+have made sure that nothing runs it, you can delete it yourself: the index first, then its platform images and
+attestation, with their digests from its `kept` line.
 
 ```bash
 aws ecr batch-delete-image --repository-name my-service --image-ids imageDigest=sha256:<index digest>
@@ -145,7 +153,17 @@ aws ecr batch-delete-image --repository-name my-service --image-ids imageDigest=
 
 ### An Image Something Runs Is `would_delete`
 
-The cleanup judged it not in use. Look at its line: `use_judged_by` and `never_pulled` say how.
+The cleanup judged it not in use. Look at its line: `use_judged_by` and `never_pulled` say how, and `in_use_by` is
+empty: nothing in ECS or Lambda in the repository's account and Region runs it.
+
+The cleanup doesn't see:
+
+- EKS;
+- Docker run directly on EC2;
+- an ECS task started by a schedule or by hand, outside a service, unless it runs at the time;
+- CodeBuild and App Runner;
+- other Regions;
+- something outside the account that pulls with a role of this account.
 
 ECR's pull record misses some pulls:
 
@@ -156,8 +174,9 @@ ECR's pull record misses some pulls:
 - **A pull by a principal in the registry's pull-time update exclusions.**
 
 Put the tag that the running service or task uses in `retain_tags`. Do it before you turn deletion on: a deletion
-can't be undone. The cleanup reads every image it judged never pulled again, 13 times over two minutes, before it
-decides; the `recheck` line shows what it read, and `pulled_on_recheck` counts the pulls it found that way.
+can't be undone. Before it decides, the cleanup reads the pull records of every candidate's platform images again, 13
+times over two minutes, then the running ECS tasks; the `recheck` line shows what it read, the newer pulls it found and
+the candidates it dropped, and `pulled_on_recheck` and `dropped_on_recheck` count them.
 
 ### A Run Deletes Fewer Images Than It Could
 
@@ -176,6 +195,11 @@ exception and its message:
   the run, by the lifecycle policy or by hand. The next run reads the repository afresh.
 - **`ECR didn't return these manifests`, or `ECR didn't return the manifests of [...]`.** It couldn't read an index's
   manifest, so it doesn't know what the index references.
+- **`AccessDeniedException` from ECS or Lambda.** The function's role reads ECS and Lambda in the repository's account
+  and Region; a service control policy or a permissions boundary may deny it. Without those reads, what runs would go
+  unseen.
+- **`ECS didn't describe these tasks`, or `ECS didn't describe the services [...]`.** A task or service ECS listed was
+  gone when the function asked about it. The next run reads ECS afresh.
 - **`The manifest of ... wasn't read`, or `The index ... lists no manifests`.** It couldn't map an index to its
   manifests.
 - **`botocore ... models ... without [...]: the package's boto3 is too old to judge.`** The function's package has a

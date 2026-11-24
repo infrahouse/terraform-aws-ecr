@@ -154,10 +154,12 @@ use.
 **`vulnerable_image_cleanup_soak_days`**, at least 1, decides for an image that Inspector reports not running now
 (`inUseCount` 0): one it last saw in use (`lastInUseAt`), or ECR recorded a pull of, within this many days is
 protected, and one before isn't.
-An image running now is protected whatever the soak. So is one without Inspector's in-use data that ECR recorded a
-pull of: within the soak, as in use; before it, as unknown. Raise the soak for intermittent use, such as a task that
-runs weekly: between runs Inspector reports it unused, and with the default 2 days the cleanup can delete it. A tag
-in `retain_tags` is the safer fix.
+An image running now is protected whatever the soak, and so is one that ECS or Lambda runs or names. One without
+Inspector's in-use data that ECR recorded a pull of within the soak is protected as in use. Before the soak, it is
+deleted when nothing in ECS or Lambda runs it and the repository's policy lets no one outside the account pull, and
+kept as unknown otherwise. Raise the soak for intermittent use that the cleanup doesn't see, such as a task a schedule
+starts weekly outside a service: between runs nothing runs it, and with the default 2 days the cleanup can delete it.
+A tag in `retain_tags` is the safer fix.
 
 **`vulnerable_image_cleanup_protect_rollback_candidates`** protects the rollback candidates the lifecycle policy keeps,
 vulnerable or not, so a rollback can go to them until they rotate out. Set it to `false` to delete a vulnerable
