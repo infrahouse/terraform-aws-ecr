@@ -291,10 +291,10 @@ An image is protected, and kept, when any of these hold:
   `vulnerable_image_cleanup_protect_rollback_candidates` is true (the
   default), and only when one of the two is set, as the lifecycle policy
   has no rollback candidate rule otherwise.
-- It is in use. ECS or Lambda runs it: a running ECS task, the task
-  definition of an ECS service's deployment, or a version of a Lambda
-  function names one of its digests, or one of its tags in this
-  repository. Or Inspector counts something that runs it (`inUseCount`),
+- It is in use. ECS or Lambda runs it: a running ECS task, an ECS
+  service's deployment (the digest its revision resolved, or its task
+  definition), or a version of a Lambda function names one of its
+  digests, or one of its tags in this repository. Or Inspector counts something that runs it (`inUseCount`),
   or saw it in use within `vulnerable_image_cleanup_soak_days` (default
   2, `lastInUseAt`). Or ECR recorded a pull of its platform image, or of
   a single-manifest image, within the soak (`lastRecordedPullTime`).
@@ -304,9 +304,10 @@ An image is protected, and kept, when any of these hold:
 - The job can't tell whether it is in use. That is a platform image, or
   a single-manifest image, that nothing in ECS or Lambda runs, that
   Inspector gives no in-use data on, that ECR recorded a pull of before
-  the soak, when the job's view isn't complete: the repository's policy
-  lets someone outside the account pull, and a long-running task there
-  that pulled it then may still run it. Or one that Inspector gives only
+  the soak, when the job's view isn't complete: the repository's or the
+  registry's policy lets someone outside the account pull, and a
+  long-running task there that pulled it then may still run it, or an
+  ECS service shows no revision to say what its tag resolved to. Or one that Inspector gives only
   part of its in-use data on. Or one that Inspector gives no in-use data
   on, that ECR has no pull record of, and that was pushed before
   2022-03-03: AWS released ECR's pull time on 2022-03-02, so such an
@@ -323,10 +324,11 @@ What the job sees, in the repository's account and Region:
 
 - Inspector's in-use data;
 - ECR's pull record;
-- ECS's running tasks and services: every cluster's running tasks, and
-  the task definitions of every service's PRIMARY and ACTIVE deployments
-  and task sets, so a service scaled to zero, mid-deployment or rolling
-  back is seen;
+- ECS's running tasks and services: every cluster's running tasks; the
+  digests every service's revisions resolved its tags to, those its
+  current deployment replaces or rolls back to included; and the task
+  definitions of its PRIMARY and ACTIVE deployments and task sets. So a
+  service scaled to zero, mid-deployment or rolling back is seen;
 - Lambda's versions: every version of every container image function,
   not only `$LATEST`, as a rollback to a version runs its image.
 
@@ -337,28 +339,37 @@ What it doesn't see:
 - an ECS task started by a schedule or by hand, outside a service: the
   job sees it only while it runs;
 - CodeBuild and App Runner;
-- other Regions.
+- other Regions;
+- anything else in the account that pulls from ECR, such as AWS Batch
+  or SageMaker.
 
 What to do about it: put any tag such a thing pins in `retain_tags`.
 
-Other accounts: the job detects them through the repository policy, and
-keeps pulled images. When the policy lets anyone outside the account
-pull (another account, `*`, an organization, `NotPrincipal`, or a
-service other than Lambda acting for this account's functions), the
-view isn't complete, and an image ECR recorded a pull of is kept,
-however old the pull. Something outside the account that pulls with a
-role of this account looks like this account to the policy: put the
-tags it pins in `retain_tags` too.
+Other accounts: the job detects them through the repository's and the
+registry's policies, and keeps pulled images. When either lets anyone
+outside the account pull from this repository (another account, `*`, an
+organization, `NotPrincipal`, or a service other than Lambda acting for
+this account's functions), the view isn't complete, and an image ECR
+recorded a pull of is kept, however old the pull. Something outside the
+account that pulls with a role of this account looks like this account
+to the policies: put the tags it pins in `retain_tags` too.
 
 ### How it judges use
 
-First from what ECS and Lambda run. A running task's digest, the index's
-when the image is one, protects the whole image; so does a task
-definition's or a function version's digest, whichever manifest it
-names. A tag protects the image that carries it in this repository: a
-service's next task pulls the image its task definition's tag names
-then. Lambda runs the digest it resolved when the version was deployed,
-so a function's tag counts only when Lambda gives no digest.
+First from what ECS and Lambda run. A digest protects the whole image,
+whichever manifest it names: a running task's (the index's when the
+image is one), a service revision's, a task definition's, or a function
+version's. ECS resolves a deployment's tags to digests when it starts
+the deployment's first task, and starts every later task of it from
+those digests, though a tag has moved since (version consistency, on by
+default): the job reads them from the service's revisions. A tag
+protects the image that carries it in this repository, for a deployment
+that has started no task yet, a container with version consistency off,
+or a CodeDeploy or external deployment, which start what the tag names.
+A service under ECS's controller that shows no revision, whose task
+definition names this repository by tag, makes the view incomplete.
+Lambda runs the digest it resolved when the version was deployed, so a
+function's tag counts only when Lambda gives no digest.
 
 Otherwise from Inspector's in-use data, `inUseCount` and `lastInUseAt`,
 when Inspector gives it. Inspector leaves both out for an image it has
@@ -420,7 +431,7 @@ What ECR's pull record doesn't show, so put every tag something pins in
 
 When the job can't judge, it deletes nothing: an API error, throttling
 that outlasts the retries, or a page or manifest it can't read fails the
-run before any deletion, the reads of the repository's policy, ECS and
+run before any deletion, the reads of the policies, ECS and
 Lambda included, and the Lambda's alarm emails
 `vulnerable_image_cleanup_alarm_emails`.
 
@@ -444,8 +455,8 @@ its role has no `ecr:BatchDeleteImage` at all. Each run logs, as JSON:
   (`images_in_use_by`: `ecs`, `lambda`, `inspector`, `ecr_pull_record`),
   the view (`view`: whether it was `complete`, why not, as in
   `"repository policy allows account 111122223333"`, and the clusters,
-  running tasks, services, task definitions and function versions it
-  read), deleted, and left by the cap.
+  running tasks, services, service revisions, task definitions and
+  function versions it read), deleted, and left by the cap.
 
 If a deletion fails part way, say ECR refuses a manifest or throttles
 past the retries, the run logs one `"delete_failed"` line naming the
@@ -563,13 +574,13 @@ Terraform 1.5 and AWS provider 5.11.
 | <a name="input_tag_prefix_list"></a> [tag\_prefix\_list](#input\_tag\_prefix\_list) | List of tag prefixes for tagged image lifecycle rules.<br/>Only tagged images whose tag starts with one of these prefixes<br/>will be expired, e.g. ["v", "release-"] matches "v1.0", "release-2026".<br/>At least one of tag\_pattern\_list or tag\_prefix\_list is required<br/>when expire\_days\_tagged or expire\_count\_tagged is set. | `list(string)` | `null` | no |
 | <a name="input_vulnerable_image_cleanup_alarm_emails"></a> [vulnerable\_image\_cleanup\_alarm\_emails](#input\_vulnerable\_image\_cleanup\_alarm\_emails) | Email addresses that get the cleanup Lambda's alarms, through terraform-aws-lambda-monitored. Required<br/>when the cleanup is on: a failed run alarms. AWS sends each address a confirmation email to accept. | `list(string)` | `[]` | no |
 | <a name="input_vulnerable_image_cleanup_dry_run"></a> [vulnerable\_image\_cleanup\_dry\_run](#input\_vulnerable\_image\_cleanup\_dry\_run) | The cleanup only logs what it would delete, and its role has no ecr:BatchDeleteImage. Set to false to<br/>delete: a deletion can't be undone. | `bool` | `true` | no |
-| <a name="input_vulnerable_image_cleanup_enabled"></a> [vulnerable\_image\_cleanup\_enabled](#input\_vulnerable\_image\_cleanup\_enabled) | Turns on the vulnerable image cleanup: a scheduled Lambda that deletes the images Amazon Inspector<br/>reports vulnerable, at or above vulnerable\_image\_cleanup\_min\_severity with a fix available, that nothing<br/>protects. An image is protected when it carries a tag in retain\_tags, is a rollback candidate the<br/>lifecycle policy keeps, is in use or was within the soak, was pushed within the least age, or when the<br/>job can't tell whether it is in use. It judges use from what ECS (running tasks, services' deployments)<br/>and Lambda (every function version) run in the repository's account and Region, from Inspector's in-use<br/>data and, without it, from ECR's pull record: an image pushed from 2022-03-03 whose platform images ECR<br/>never recorded a pull of was never run, so it isn't in use; an older one without a pull record is kept.<br/>One last pulled before the soak that nothing in ECS or Lambda runs isn't in use when the repository's<br/>policy lets no one outside the account pull, and is kept otherwise. It doesn't see EKS, Docker run on<br/>EC2, an ECS task outside a service unless it is running, CodeBuild, App Runner or other Regions, and ECR<br/>refreshes the pull time at least once every 24 hours: put every tag something pins in retain\_tags. An<br/>image index is deleted with the manifests it references.<br/>Turned on, it runs dry until vulnerable\_image\_cleanup\_dry\_run is false. A deletion can't be undone.<br/>Off by default: false creates nothing. | `bool` | `false` | no |
+| <a name="input_vulnerable_image_cleanup_enabled"></a> [vulnerable\_image\_cleanup\_enabled](#input\_vulnerable\_image\_cleanup\_enabled) | Turns on the vulnerable image cleanup: a scheduled Lambda that deletes the images Amazon Inspector<br/>reports vulnerable, at or above vulnerable\_image\_cleanup\_min\_severity with a fix available, that nothing<br/>protects. An image is protected when it carries a tag in retain\_tags, is a rollback candidate the<br/>lifecycle policy keeps, is in use or was within the soak, was pushed within the least age, or when the<br/>job can't tell whether it is in use. It judges use from what ECS (running tasks, services' deployments)<br/>and Lambda (every function version) run in the repository's account and Region, from Inspector's in-use<br/>data and, without it, from ECR's pull record: an image pushed from 2022-03-03 whose platform images ECR<br/>never recorded a pull of was never run, so it isn't in use; an older one without a pull record is kept.<br/>One last pulled before the soak that nothing in ECS or Lambda runs isn't in use when neither the<br/>repository's nor the registry's policy lets anyone outside the account pull, and is kept otherwise. It<br/>doesn't see EKS, Docker run on EC2, an ECS task outside a service unless it is running, CodeBuild, App<br/>Runner, AWS Batch, SageMaker or other Regions, and ECR refreshes the pull time at least once every 24<br/>hours: put every tag something pins in retain\_tags. An image index is deleted with the manifests it<br/>references.<br/>Turned on, it runs dry until vulnerable\_image\_cleanup\_dry\_run is false. A deletion can't be undone.<br/>Off by default: false creates nothing. | `bool` | `false` | no |
 | <a name="input_vulnerable_image_cleanup_max_deletions"></a> [vulnerable\_image\_cleanup\_max\_deletions](#input\_vulnerable\_image\_cleanup\_max\_deletions) | The most images the cleanup deletes in a run. An image index with the manifests it references counts as<br/>one image. The oldest go first; the rest wait for the next run. | `number` | `10` | no |
 | <a name="input_vulnerable_image_cleanup_min_age_days"></a> [vulnerable\_image\_cleanup\_min\_age\_days](#input\_vulnerable\_image\_cleanup\_min\_age\_days) | An image pushed within this many days is protected, so an image waiting for its pin isn't deleted. | `number` | `7` | no |
 | <a name="input_vulnerable_image_cleanup_min_severity"></a> [vulnerable\_image\_cleanup\_min\_severity](#input\_vulnerable\_image\_cleanup\_min\_severity) | The least Inspector severity that makes an image vulnerable: CRITICAL, HIGH, MEDIUM or LOW. Only ACTIVE<br/>findings with a fix available count. | `string` | `"HIGH"` | no |
 | <a name="input_vulnerable_image_cleanup_protect_rollback_candidates"></a> [vulnerable\_image\_cleanup\_protect\_rollback\_candidates](#input\_vulnerable\_image\_cleanup\_protect\_rollback\_candidates) | Protects the rollback candidates the lifecycle policy keeps (rollback\_candidate\_retain\_count and<br/>rollback\_candidate\_retain\_days) even when they are vulnerable, so a rollback can go to them until they<br/>rotate out. Set to false to delete a vulnerable rollback candidate once nothing else protects it, so a<br/>rollback can only go to an image without such findings. | `bool` | `true` | no |
 | <a name="input_vulnerable_image_cleanup_schedule"></a> [vulnerable\_image\_cleanup\_schedule](#input\_vulnerable\_image\_cleanup\_schedule) | When the cleanup runs: an EventBridge schedule expression, rate(...) or cron(...).<br/>See https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html | `string` | `"rate(1 day)"` | no |
-| <a name="input_vulnerable_image_cleanup_soak_days"></a> [vulnerable\_image\_cleanup\_soak\_days](#input\_vulnerable\_image\_cleanup\_soak\_days) | An image in use, or used within this many days by Inspector's lastInUseAt, is protected, and so is one whose<br/>platform image or single manifest ECR's lastRecordedPullTime says was pulled within this many days. Without<br/>Inspector's in-use data, one pulled earlier that nothing in ECS or Lambda runs isn't in use when the<br/>repository's policy lets no one outside the account pull; otherwise it is kept, as a task in another account<br/>that pulled it then may still run it. One never pulled was never run, and isn't in use. An index's own pull<br/>time doesn't count, as ECR records the job's own read of each index as a pull. ECR refreshes the pull time at<br/>least once every 24 hours, so a first pull within the last day may not show yet: put a tag something pins in<br/>retain\_tags rather than rely on a pull. | `number` | `2` | no |
+| <a name="input_vulnerable_image_cleanup_soak_days"></a> [vulnerable\_image\_cleanup\_soak\_days](#input\_vulnerable\_image\_cleanup\_soak\_days) | An image in use, or used within this many days by Inspector's lastInUseAt, is protected, and so is one whose<br/>platform image or single manifest ECR's lastRecordedPullTime says was pulled within this many days. Without<br/>Inspector's in-use data, one pulled earlier that nothing in ECS or Lambda runs isn't in use when neither the<br/>repository's nor the registry's policy lets anyone outside the account pull; otherwise it is kept, as a task in<br/>another account that pulled it then may still run it. One never pulled was never run, and isn't in use. An<br/>index's own pull time doesn't count, as ECR records the job's own read of each index as a pull. ECR refreshes<br/>the pull time at least once every 24 hours, so a first pull within the last day may not show yet: put a tag<br/>something pins in retain\_tags rather than rely on a pull. | `number` | `2` | no |
 
 ## Outputs
 

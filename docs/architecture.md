@@ -134,12 +134,15 @@ All in `vulnerable_image_cleanup.tf`, each with `count`, so none of it exists wh
     - `ecr:DescribeImages`, `ecr:BatchGetImage` and `ecr:GetRepositoryPolicy` on this repository;
     - `ecr:BatchDeleteImage` on this repository, only when `vulnerable_image_cleanup_dry_run` is false;
     - `inspector2:ListFindings` and `inspector2:ListCoverage`, which take no resource ARN;
+    - `ecr:GetRegistryPolicy`, which takes no resource ARN;
     - `ecs:ListClusters` and `ecs:DescribeTaskDefinition`, which take no resource ARN;
     - `ecs:ListTasks` and `ecs:ListServices` on `*`, held by the `ecs:cluster` key to the clusters of the
       repository's account and Region: ListServices names no resource type, and ListTasks names the container
       instance, which a cluster without instances has none of;
     - `ecs:DescribeTasks` on the tasks, and `ecs:DescribeServices` on the services, of the repository's account and
       Region;
+    - `ecs:DescribeServiceDeployments` on the services and service deployments, and `ecs:DescribeServiceRevisions` on
+      the services and service revisions, of the repository's account and Region: each action names both types;
     - `lambda:ListFunctions`, which takes no resource ARN, and `lambda:GetFunction` on the functions, and their
       versions, of the repository's account and Region.
 - **An EventBridge rule** on `vulnerable_image_cleanup_schedule`, its target, and the permission that lets EventBridge
@@ -162,11 +165,15 @@ Lambda in the repository's account and Region, taken from the repository's ARN.
     - Inspector's `ListFindings`: the ACTIVE findings on this repository's images, at or above
       `vulnerable_image_cleanup_min_severity`, with a fix available;
     - Inspector's `ListCoverage`: each image's in-use data;
-    - ECR's `GetRepositoryPolicy`: whether anyone outside the account may pull. None is fine;
+    - ECR's `GetRepositoryPolicy` and `GetRegistryPolicy`: whether anyone outside the account may pull from this
+      repository. None is fine;
     - ECS's `ListClusters`, `ListTasks` and `DescribeTasks`: every cluster's running tasks, and each container's
       image and digest;
     - ECS's `ListServices`, `DescribeServices` and `DescribeTaskDefinition`: every service's PRIMARY and ACTIVE
       deployments and task sets, and the images their task definitions name, scaled to zero or not;
+    - ECS's `DescribeServiceDeployments` and `DescribeServiceRevisions`: each service's current revisions, and its
+      current deployment's target, the revisions it replaces and the one it rolls back to, with the digests each
+      revision resolved its tags to;
     - Lambda's `ListFunctions` (every version) and `GetFunction`: the image each version of each container image
       function runs.
 
@@ -202,8 +209,9 @@ manifest it references. Each kept image's log line lists its reasons:
   images counted, the first `rollback_candidate_retain_count`; or those pushed within
   `rollback_candidate_retain_days`. With neither set, the policy has no rollback candidate rule, and nothing is
   protected as one.
-- **`in_use`**: ECS or Lambda runs it: a running task, the task definition of a service's deployment, or a version
-  of a container image function names one of its digests, or one of its tags in this repository. Or Inspector counts
+- **`in_use`**: ECS or Lambda runs it: a running task, a service's deployment (the digest its revision resolved, or
+  its task definition), or a version of a container image function names one of its digests, or one of its tags in
+  this repository. Or Inspector counts
   something that runs it (`inUseCount` above 0), or saw it in use within `vulnerable_image_cleanup_soak_days`
   (`lastInUseAt`). Or ECR recorded a pull of one of its platform images, or of a single-manifest image, within the
   soak (`lastRecordedPullTime`).
@@ -225,9 +233,15 @@ in this repository:
 
 - **a running ECS task**, in any cluster. ECS reports the digest it resolved, the index's when the image is one, and a
   container still pending names the image by its reference;
-- **the task definition of an ECS service's deployment**: its PRIMARY and ACTIVE deployments and task sets, so a
-  service scaled to zero, one mid-deployment and one rolling back are seen. By tag, it protects the image with that
-  tag; by digest, that digest;
+- **an ECS service's deployment**, scaled to zero, mid-deployment or rolling back. Under ECS's deployment controller,
+  a deployment resolves each container's tag to a digest when it starts its first task, and starts every later task
+  of it from that digest, though the tag has moved since (version consistency, on by default). Its service revision
+  records the digest: the function reads the service's current revisions, and its current deployment's target, the
+  revisions it replaces and the one it rolls back to. It also reads the task definitions of the PRIMARY and ACTIVE
+  deployments and task sets: by digest, they protect that digest; by tag, the image with that tag, which is what a
+  deployment that has started no task yet, a container with version consistency off, or a CodeDeploy or external
+  deployment starts. A service under ECS's controller that shows no revision, whose task definition names this
+  repository by tag with version consistency on, may run a digest the function can't see: the view isn't complete;
 - **a version of a container image Lambda function**, every version and not only `$LATEST`, as a rollback to a version
   runs its image. Lambda runs the digest it resolved when the version was deployed (`ResolvedImageUri`).
 
@@ -259,13 +273,16 @@ An image is `in_use_unknown` when any of its runnable manifests is unknown, and 
 Inspector leaves both in-use fields out for an image it has never seen in use, and some accounts get them for no image
 at all; then the pull record decides.
 
-**The view is complete** when every read of ECS, Lambda and the repository's policy finished (a read that fails fails
-the run), and the repository's policy lets no one outside the account pull. A statement lets pull when it allows
-`ecr:BatchGetImage` or `ecr:GetDownloadUrlForLayer`, by name, by a wildcard, or by a `NotAction` that leaves one out.
-Then any of these makes the view incomplete: another account; `*`; `NotPrincipal`; a principal the function can't
-place in an account; an organization condition; a service other than Lambda; Lambda without a condition that holds it
-to this account's functions (`aws:SourceArn` or `aws:SourceAccount`, as the statement Lambda adds to a repository for
-its functions has). The summary's `view` says whether it was complete, and why not.
+**The view is complete** when every read of ECS, Lambda and the two policies finished (a read that fails fails the
+run), every ECS service under ECS's controller that names this repository by tag shows a revision, and neither the
+repository's nor the registry's policy lets anyone outside the account pull from this repository. A registry policy's
+statement counts when its `Resource` may name this repository (a wildcard included), its `NotResource` doesn't, or it
+names neither. A statement lets pull when it allows `ecr:BatchGetImage` or `ecr:GetDownloadUrlForLayer`, by name, by
+a wildcard, or by a `NotAction` that leaves one out. Then any of these makes the view incomplete: another account;
+`*`; `NotPrincipal`; a principal the function can't place in an account; an organization condition; a service other
+than Lambda; Lambda without a condition that holds it to this account's functions (`aws:SourceArn` or
+`aws:SourceAccount`, as the statement Lambda adds to a repository for its functions has). The summary's `view` says
+whether it was complete, and why not.
 
 What the function doesn't see:
 
@@ -273,9 +290,11 @@ What the function doesn't see:
 - Docker run directly on EC2;
 - an ECS task started by a schedule or by hand, outside a service: it sees one only while it runs;
 - CodeBuild and App Runner;
-- other Regions.
+- other Regions;
+- anything else in the account that pulls from ECR, such as AWS Batch or SageMaker.
 
-Nor something outside the account that pulls with a role of this account: the policy can't tell it from this account.
+Nor something outside the account that pulls with a role of this account: the policies can't tell it from this
+account.
 Put any tag such a thing pins in `retain_tags`.
 
 Inspector's scans record no pull. The function's own reads record one on what they read with `BatchGetImage`: every
@@ -295,9 +314,9 @@ What ECR's pull record doesn't show, so every tag that something pins belongs in
 When the function can't judge, it deletes nothing:
 
 - An API error, throttling that outlasts botocore's retries (standard mode, 10 attempts), or a page it can't read
-  fails the run before any deletion: in the reads of ECR, Inspector, the repository's policy, ECS and Lambda, and in
-  the reads again before deleting.
-- So does a task or service ECS listed and doesn't describe.
+  fails the run before any deletion: in the reads of ECR, Inspector, the repository's and the registry's policies,
+  ECS and Lambda, and in the reads again before deleting.
+- So does a task, service, service deployment or service revision ECS listed and doesn't describe.
 - So does a manifest ECR doesn't return, an index that lists no manifests, or a botocore model without the fields
   above.
 - A deletion ECR refuses fails the run, unless the image is already gone (`ImageNotFound`). ECR refuses to delete a

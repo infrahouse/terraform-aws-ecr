@@ -52,24 +52,30 @@ are defined in `locals.tf` and merged onto the ECR repository.
   `ecr:BatchGetImage` and `ecr:GetRepositoryPolicy` on the repository;
   `ecr:BatchDeleteImage` on it only when
   `vulnerable_image_cleanup_dry_run` is false;
-  `inspector2:ListFindings` and `inspector2:ListCoverage` on `*`. ECS
-  and Lambda, read-only, in the repository's account and Region:
-  `ecs:ListClusters`, `ecs:DescribeTaskDefinition` and
-  `lambda:ListFunctions` on `*` (no resource type); `ecs:ListTasks` and
-  `ecs:ListServices` on `*` with `ecs:cluster` held to this account's
-  and Region's clusters; `ecs:DescribeTasks` and `ecs:DescribeServices`
-  on its tasks and services; `lambda:GetFunction` on its functions.
+  `inspector2:ListFindings`, `inspector2:ListCoverage` and
+  `ecr:GetRegistryPolicy` on `*`. ECS and Lambda, read-only, in the
+  repository's account and Region: `ecs:ListClusters`,
+  `ecs:DescribeTaskDefinition` and `lambda:ListFunctions` on `*` (no
+  resource type); `ecs:ListTasks` and `ecs:ListServices` on `*` with
+  `ecs:cluster` held to this account's and Region's clusters;
+  `ecs:DescribeTasks` and `ecs:DescribeServices` on its tasks and
+  services; `ecs:DescribeServiceDeployments` and
+  `ecs:DescribeServiceRevisions` on its services and service
+  deployments or revisions (each names both types);
+  `lambda:GetFunction` on its functions. The function gets the
+  repository's ARN as `REPOSITORY_ARN`.
 - **vulnerable_image_cleanup/cleanup.py**: the handler and the AWS I/O:
-  reads ECR (every image, every index's manifest, the repository's
-  policy), Inspector (findings, coverage), ECS (every cluster's running
-  tasks, every service's deployed task definitions) and Lambda (every
-  version of every container image function); decides; reads again
+  reads ECR (every image, every index's manifest, the repository's and
+  the registry's policies), Inspector (findings, coverage), ECS (every
+  cluster's running tasks; every service's deployed task definitions,
+  current deployment and service revisions) and Lambda (every version
+  of every container image function); decides; reads again
   the candidates' pull records and the running tasks (`recheck`); then
   deletes or, dry, only logs.
 - **vulnerable_image_cleanup/selection.py**: the rules, as pure Python
   over botocore-shaped answers: the view of what runs (`Runtime`,
-  `RuntimeBuilder`) and the repository policy's gaps
-  (`repository_policy_gaps`) included.
+  `RuntimeBuilder`) and the policies' gaps (`repository_policy_gaps`,
+  `registry_policy_gaps`) included.
 - **vulnerable_image_cleanup/requirements.txt**: `boto3 ~= 1.41`, the
   first release whose botocore models Inspector's `inUseCount` and
   `lastInUseAt` and ECR's `imageStatus`. Botocore drops fields its model
@@ -90,9 +96,16 @@ The rules, which must stay right:
   unknown.
 - In use by ECS or Lambda (`use_judged_by` `ecs` or `lambda`, the
   uses in `in_use_by`): a running ECS task (any cluster; its
-  `imageDigest`, the index's in production, or its reference), the task
-  definition of a service's PRIMARY or ACTIVE deployment or task set
-  (scaled to zero too), or any version of a container image function
+  `imageDigest`, the index's in production, or its reference); a
+  service's deployment, scaled to zero too: the digests its service
+  revisions resolved (`containerImages[].imageDigest`; its current
+  revisions, and its current deployment's target, sources and rollback
+  revision), as ECS's version consistency starts every task of a
+  deployment from the digest it resolved, though the tag has moved; and
+  the task definitions of its PRIMARY and ACTIVE deployments and task
+  sets, whose tags count for a deployment that hasn't resolved yet,
+  version consistency off, or a CodeDeploy or external controller; or
+  any version of a container image function
   (`ResolvedImageUri`; `ImageUri` only without a digest). A digest
   protects the unit whichever member it names, from any repository's
   reference; a tag only from a reference to this repository (account,
@@ -107,8 +120,13 @@ The rules, which must stay right:
   pulled within the soak, in use; pulled before it, not in use when the
   view is complete, unknown otherwise, as a long-running task in
   another account may still run it. The view is complete when every
-  read finished and the repository's policy lets no one outside the
-  account pull (another account, `*`, `NotPrincipal`, an organization
+  read finished, every service under ECS's controller whose task
+  definition names this repository by tag (version consistency on)
+  shows a revision, and neither the repository's nor the registry's
+  policy lets anyone outside the account pull from this repository (a
+  registry statement counts when its `Resource` may match the
+  repository's ARN, its `NotResource` doesn't, or it has neither;
+  another account, `*`, `NotPrincipal`, an organization
   key, an unplaceable principal, a service other than Lambda, or Lambda
   not held to this account's functions by `aws:SourceArn` or
   `aws:SourceAccount`, each make it incomplete). Pushed before
@@ -185,12 +203,14 @@ The vulnerable image cleanup's tests:
   repository with nothing vulnerable, an ECS service scaled to zero
   naming an image by tag, and a container image function the test makes
   (version 1 and `$LATEST` on two images); checks the deployed function
-  reads ECS and Lambda under its role and sees both, that a repository
+  reads ECS (the service's revision included) and Lambda under its role
+  and sees both, that a repository
   policy letting another account pull makes the view incomplete, the
   role's policies (DescribeTasks's scope through IAM's simulator, as no
   task runs), and that the function's reads record a pull of the
-  indexes only. Ageing a pull past the soak can't be done in a test:
-  that path is the unit tests'.
+  indexes only. Ageing a pull past the soak can't be done in a test,
+  nor a registry policy set in the shared account: those are the unit
+  tests'.
 - `tests/test_vulnerable_image_cleanup_e2e.py`
   (`test_data/vulnerable_image_cleanup_e2e/`): needs `docker buildx`;
   pushes images from an old Debian base, pulls one with `docker pull`,
