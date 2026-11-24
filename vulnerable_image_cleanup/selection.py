@@ -1,7 +1,7 @@
 """
 Decides which images the vulnerable image cleanup deletes.
 
-Nothing here calls AWS. The functions take the answers ECR and Inspector give, shaped as botocore
+Nothing here calls AWS. The functions take the answers ECR, Inspector, ECS and Lambda give, shaped as botocore
 returns them, so the rules can be tested on their own.
 
 An image is protected, and kept, when any of these hold:
@@ -13,9 +13,12 @@ An image is protected, and kept, when any of these hold:
 * it isn't ACTIVE (archived images are outside the lifecycle's rules too);
 * the job can't tell whether it is in use.
 
-The job judges use from Inspector's in-use data and from ECR's pull record. A container runtime pulls an image to run
-it, and ECR records the pull on the manifest it fetched, so an image whose runnable manifests ECR never recorded a pull
-of was never run.
+The job judges use from what ECS and Lambda run, from Inspector's in-use data and from ECR's pull record. A unit is in
+use when a running ECS task, the task definition of an ECS service's deployment, or a Lambda function version names
+one of its digests or tags. Otherwise a container runtime pulls an image to run it, and ECR records the pull on the
+manifest it fetched, so an image whose runnable manifests ECR never recorded a pull of was never run. One pulled before
+the soak is not in use when the view is complete: ECS and Lambda were read in full, and the repository's policy lets
+no one outside the account pull, so nothing the job can't see runs it from another account.
 
 An image index and the manifests it references are judged, and deleted, as one image: a "unit".
 """
@@ -25,7 +28,7 @@ from __future__ import annotations
 import json
 import re
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import (
     Any,
@@ -64,9 +67,50 @@ NOT_ACTIVE = "not_active"
 REASONS = (RETAINED_TAG, ROLLBACK_CANDIDATE, IN_USE, IN_USE_UNKNOWN, RECENT, NOT_ACTIVE)
 
 # How a unit's use was judged, as its log line says.
+JUDGED_BY_ECS = "ecs"
+JUDGED_BY_LAMBDA = "lambda"
 JUDGED_BY_INSPECTOR = "inspector"
 JUDGED_BY_PULL_RECORD = "ecr_pull_record"
 JUDGED_UNKNOWN = "unknown"
+# What can show a unit in use, as the summary counts them.
+USE_SOURCES = (
+    JUDGED_BY_ECS,
+    JUDGED_BY_LAMBDA,
+    JUDGED_BY_INSPECTOR,
+    JUDGED_BY_PULL_RECORD,
+)
+
+# What a run counts of what it read, as the summary's view says.
+VIEW_COUNTS = (
+    "ecs_clusters",
+    "ecs_running_tasks",
+    "ecs_services",
+    "ecs_task_definitions",
+    "lambda_image_versions",
+)
+# How ECS or Lambda names an image a use runs, as a use's log line says.
+VIA_RUNNING_TASK = "running_task"
+VIA_DEPLOYMENT = "deployment"
+VIA_FUNCTION_VERSION = "function_version"
+# A service's deployments, and task sets, whose task definitions it runs or may go back to: the one it deploys, and
+# those it is replacing. INACTIVE ones are done with; DRAINING task sets' tasks are stopping, and running ones are read.
+DEPLOYED_STATUSES = frozenset({"PRIMARY", "ACTIVE"})
+# What a pull needs: the manifest, and the layers.
+PULL_ACTIONS = ("ecr:batchgetimage", "ecr:getdownloadurlforlayer")
+# Condition keys that grant an organization, or a part of one, rather than an account.
+ORGANIZATION_KEYS = frozenset(
+    {
+        "aws:principalorgid",
+        "aws:principalorgpaths",
+        "aws:sourceorgid",
+        "aws:sourceorgpaths",
+    }
+)
+# Condition operators under which a value names what a request must come from. IfExists, ForAllValues and the negated
+# operators let a request without the key through.
+_RESTRICTING_OPERATORS = frozenset(
+    {"StringEquals", "StringLike", "ArnEquals", "ArnLike"}
+)
 
 # AWS released ECR's lastRecordedPullTime on 2022-03-02: botocore 1.24.11's changelog notes "This release adds support
 # for tracking images lastRecordedPullTime". An image pushed before then may have been pulled without a record. The
@@ -77,11 +121,17 @@ PULL_RECORD_START = datetime(2022, 3, 3, tzinfo=timezone.utc)
 _BY_INSPECTOR = "inspector"
 _NEVER_PULLED = "never_pulled"
 _PULLED_WITHIN_SOAK = "pulled_within_soak"
+_PULLED_BEFORE_SOAK = "pulled_before_soak"
 _UNKNOWN = "unknown"
+_BY_PULL_RECORD = frozenset({_NEVER_PULLED, _PULLED_WITHIN_SOAK, _PULLED_BEFORE_SOAK})
 
 _IMAGE_ARN = re.compile(
     r"^arn:[^:]+:ecr:[^:]+:(?P<account>\d{12}):repository/(?P<repository>.+)/(?P<digest>sha256:[0-9a-f]{64})$"
 )
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_ACCOUNT_ID = re.compile(r"^\d{12}$")
+# An IAM or STS principal's ARN: its account is the fifth field.
+_PRINCIPAL_ARN = re.compile(r"^arn:[^:*?]+:(?:iam|sts)::(?P<account>\d{12}):.+$")
 
 
 class SettingsError(ValueError):
@@ -99,6 +149,7 @@ class Settings:
 
     :param repository_name: The ECR repository.
     :param registry_id: Its registry, the account id.
+    :param region: Its Region: the job reads ECR, Inspector, ECS and Lambda there.
     :param dry_run: Log what would be deleted, and delete nothing.
     :param min_severity: The least Inspector severity that makes an image vulnerable.
     :param min_age: An image pushed within this is protected.
@@ -113,6 +164,7 @@ class Settings:
 
     repository_name: str
     registry_id: str
+    region: str
     dry_run: bool
     min_severity: str
     min_age: timedelta
@@ -131,6 +183,8 @@ class Settings:
             raise SettingsError(
                 f"The registry id must be 12 digits. Got: {self.registry_id!r}"
             )
+        if not re.fullmatch(r"[a-z]{2}(-[a-z]+)+-\d+", self.region):
+            raise SettingsError(f"The Region isn't one. Got: {self.region!r}")
         if self.min_severity not in SEVERITIES:
             raise SettingsError(
                 f"The least severity must be one of {SEVERITIES}. Got: {self.min_severity!r}"
@@ -165,6 +219,7 @@ class Settings:
             return cls(
                 repository_name=environ["REPOSITORY_NAME"],
                 registry_id=environ["REGISTRY_ID"],
+                region=environ["REPOSITORY_REGION"],
                 dry_run=_boolean(environ, "DRY_RUN"),
                 min_severity=environ["MIN_SEVERITY"],
                 min_age=timedelta(days=float(environ["MIN_AGE_DAYS"])),
@@ -195,6 +250,22 @@ class Settings:
         :return: The severities at or above the least one.
         """
         return list(SEVERITIES[SEVERITIES.index(self.min_severity) :])
+
+    def names_this_repository(self, reference: "ImageReference") -> bool:
+        """
+        :param reference: An image reference, as a task definition or a function names an image.
+        :return: True if it names an image in this repository: through ECR's registry host of this account and Region,
+            in any of its forms (``dkr.ecr``, FIPS, dual-stack), and this repository's name.
+        """
+        if reference.host is None:
+            return False
+        labels = reference.host.split(".")
+        return (
+            labels[0] == self.registry_id
+            and self.region in labels
+            and any("ecr" in label for label in labels)
+            and reference.path == self.repository_name
+        )
 
 
 @dataclass(frozen=True)
@@ -466,6 +537,350 @@ class Evidence:
 
 
 @dataclass(frozen=True)
+class ImageReference:
+    """
+    An image as a task definition, a task or a function names it: ``[host/]path[:tag][@digest]``.
+
+    :param host: The registry host, lowercase, or None if the reference names none (Docker Hub).
+    :param path: The repository's path in the registry.
+    :param tag: The tag, if any.
+    :param digest: The digest, if any.
+    """
+
+    host: Optional[str]
+    path: str
+    tag: Optional[str]
+    digest: Optional[str]
+
+    @classmethod
+    def parse(cls, text: str) -> "ImageReference":
+        """
+        :param text: An image reference.
+        :return: Its parts. A reference with neither a tag nor a digest names the tag ``latest``, as a runtime pulls it.
+        """
+        name, _, digest = text.partition("@")
+        tag: Optional[str] = None
+        slash = name.rfind("/")
+        colon = name.rfind(":")
+        if colon > slash:
+            name, tag = name[:colon], name[colon + 1 :]
+        host: Optional[str] = None
+        first, separator, rest = name.partition("/")
+        if separator and ("." in first or ":" in first or first == "localhost"):
+            host, name = first.lower(), rest
+        if tag is None and not digest:
+            tag = "latest"
+        return cls(host=host, path=name, tag=tag, digest=digest or None)
+
+
+@dataclass(frozen=True)
+class Use:
+    """
+    Something ECS or Lambda runs, or would start, that names an image.
+
+    :param source: ``ecs`` or ``lambda``.
+    :param via: How it names the image: a running task, a service's deployment, or a function version.
+    :param cluster: The ECS cluster's name.
+    :param service: The ECS service's name, for a deployment or a task the service started.
+    :param task: A running task's ARN, for a task outside a service.
+    :param task_definition: The ECS task definition, ``family:revision``.
+    :param function: The Lambda function's name.
+    :param version: The function's version: a number, or ``$LATEST``.
+    """
+
+    source: str
+    via: str
+    cluster: Optional[str] = None
+    service: Optional[str] = None
+    task: Optional[str] = None
+    task_definition: Optional[str] = None
+    function: Optional[str] = None
+    version: Optional[str] = None
+
+    @property
+    def sort_key(self) -> Tuple[str, ...]:
+        """
+        :return: A key that orders uses for a log line.
+        """
+        return tuple(
+            value or ""
+            for value in (
+                self.source,
+                self.via,
+                self.cluster,
+                self.service,
+                self.task,
+                self.task_definition,
+                self.function,
+                self.version,
+            )
+        )
+
+    def describe(self) -> Dict[str, str]:
+        """
+        :return: Its facts, for a log line, without the empty ones.
+        """
+        facts = {
+            "source": self.source,
+            "via": self.via,
+            "cluster": self.cluster,
+            "service": self.service,
+            "task": self.task,
+            "task_definition": self.task_definition,
+            "function": self.function,
+            "version": self.version,
+        }
+        return {key: value for key, value in facts.items() if value is not None}
+
+
+@dataclass(frozen=True)
+class Runtime:
+    """
+    What ECS and Lambda say runs in the repository's account and Region, and whether that is all there is to see.
+
+    :param digests: For each digest a use names, the uses.
+    :param tags: For each tag of this repository a use names, the uses.
+    :param incomplete_because: Why the view isn't complete: who outside the account the repository's policy lets
+        pull. Empty if it is complete.
+    :param counts: What was read: clusters, running tasks, services, task definitions, function versions.
+    """
+
+    digests: Mapping[str, FrozenSet[Use]] = field(default_factory=dict)
+    tags: Mapping[str, FrozenSet[Use]] = field(default_factory=dict)
+    incomplete_because: Tuple[str, ...] = ()
+    counts: Mapping[str, int] = field(default_factory=dict)
+
+    @property
+    def complete(self) -> bool:
+        """
+        :return: True if every read finished (a failed one fails the run) and no one outside the account may pull.
+        """
+        return not self.incomplete_because
+
+    def describe(self) -> Dict[str, Any]:
+        """
+        :return: The view, for the summary.
+        """
+        return dict(
+            self.counts,
+            complete=self.complete,
+            incomplete_because=list(self.incomplete_because),
+        )
+
+    def merged(self, other: "Runtime") -> "Runtime":
+        """
+        :param other: A later read.
+        :return: Every use either names. A use only protects, so one a read showed counts though a later read misses
+            it. The counts and the completeness are this view's.
+        """
+        return Runtime(
+            digests=_union(self.digests, other.digests),
+            tags=_union(self.tags, other.tags),
+            incomplete_because=self.incomplete_because,
+            counts=self.counts,
+        )
+
+    def uses_of(self, images: Iterable[Image]) -> FrozenSet[Use]:
+        """
+        :param images: A unit's manifests.
+        :return: The uses that name any of their digests or tags.
+        """
+        uses: Set[Use] = set()
+        for image in images:
+            uses.update(self.digests.get(image.digest, ()))
+            for tag in image.tags:
+                uses.update(self.tags.get(tag, ()))
+        return frozenset(uses)
+
+
+class RuntimeBuilder:
+    """
+    Builds the view from botocore-shaped answers.
+
+    :param settings: The job's settings.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._digests: Dict[str, Set[Use]] = {}
+        self._tags: Dict[str, Set[Use]] = {}
+        self._incomplete: List[str] = []
+        self._counts: Dict[str, int] = dict.fromkeys(VIEW_COUNTS, 0)
+
+    # --- Public methods ---
+
+    def add_cluster(self) -> None:
+        """Count a cluster read."""
+        self._count("ecs_clusters")
+
+    def add_deployment(
+        self,
+        cluster_arn: str,
+        service: Mapping[str, Any],
+        task_definition: Mapping[str, Any],
+    ) -> None:
+        """
+        :param cluster_arn: The service's cluster.
+        :param service: One ``services`` item of DescribeServices.
+        :param task_definition: The ``taskDefinition`` of DescribeTaskDefinition, for a task definition the service
+            deploys (:func:`deployed_task_definitions`).
+        """
+        use = Use(
+            source=JUDGED_BY_ECS,
+            via=VIA_DEPLOYMENT,
+            cluster=_last_part(cluster_arn),
+            service=service.get("serviceName") or _last_part(service["serviceArn"]),
+            task_definition=_last_part(task_definition["taskDefinitionArn"]),
+        )
+        for container in task_definition.get("containerDefinitions") or ():
+            if container.get("image"):
+                self._add_reference(container["image"], use)
+
+    def add_function_version(
+        self, configuration: Mapping[str, Any], code: Mapping[str, Any]
+    ) -> None:
+        """
+        :param configuration: One ``Functions`` item of ListFunctions, of a container image function.
+        :param code: The ``Code`` of GetFunction for that version: Lambda runs the image ``ResolvedImageUri`` names.
+        """
+        use = Use(
+            source=JUDGED_BY_LAMBDA,
+            via=VIA_FUNCTION_VERSION,
+            function=configuration["FunctionName"],
+            version=configuration["Version"],
+        )
+        self._count("lambda_image_versions")
+        # Lambda resolves ImageUri to a digest when the version is deployed, and runs that digest from then on, where
+        # ECS resolves a tag each time a task starts. Without a digest in ResolvedImageUri, ImageUri names the image.
+        resolved = ImageReference.parse(code.get("ResolvedImageUri") or "")
+        if resolved.digest:
+            self._add_digest(resolved.digest, use)
+        elif code.get("ImageUri"):
+            self._add_reference(code["ImageUri"], use)
+
+    def add_repository_policy(self, text: Optional[str]) -> None:
+        """
+        :param text: The repository's policy, as GetRepositoryPolicy gives it; None if it has none.
+        """
+        self._incomplete.extend(
+            repository_policy_gaps(text, self._settings.registry_id)
+        )
+
+    def add_service(self) -> None:
+        """Count a service read."""
+        self._count("ecs_services")
+
+    def add_task(self, cluster_arn: str, task: Mapping[str, Any]) -> None:
+        """
+        :param cluster_arn: The task's cluster.
+        :param task: One ``tasks`` item of DescribeTasks, of a task whose desired status is RUNNING.
+        """
+        group = task.get("group") or ""
+        service = group[len("service:") :] if group.startswith("service:") else None
+        use = Use(
+            source=JUDGED_BY_ECS,
+            via=VIA_RUNNING_TASK,
+            cluster=_last_part(cluster_arn),
+            service=service,
+            # The tasks a service started are told apart by their service.
+            task=None if service else task.get("taskArn"),
+            task_definition=_last_part(task.get("taskDefinitionArn") or "") or None,
+        )
+        self._count("ecs_running_tasks")
+        for container in task.get("containers") or ():
+            # The digest ECS resolved, the index's when the image is one; a container still pending may have none
+            # yet, and then the reference names what it will pull.
+            if container.get("imageDigest"):
+                self._add_digest(container["imageDigest"], use)
+            if container.get("image"):
+                self._add_reference(container["image"], use)
+
+    def add_task_definition(self) -> None:
+        """Count a task definition read."""
+        self._count("ecs_task_definitions")
+
+    def build(self) -> Runtime:
+        """
+        :return: The view.
+        """
+        return Runtime(
+            digests={digest: frozenset(uses) for digest, uses in self._digests.items()},
+            tags={tag: frozenset(uses) for tag, uses in self._tags.items()},
+            incomplete_because=tuple(dict.fromkeys(self._incomplete)),
+            counts=dict(self._counts),
+        )
+
+    # --- Private methods ---
+
+    def _add_digest(self, digest: str, use: Use) -> None:
+        if _DIGEST.match(digest):
+            self._digests.setdefault(digest, set()).add(use)
+
+    def _add_reference(self, text: str, use: Use) -> None:
+        reference = ImageReference.parse(text)
+        # A digest is the image's content, whichever repository the reference names: the same digest here is the
+        # same image. A tag belongs to one repository.
+        if reference.digest:
+            self._add_digest(reference.digest, use)
+        if reference.tag and self._settings.names_this_repository(reference):
+            self._tags.setdefault(reference.tag, set()).add(use)
+
+    def _count(self, name: str) -> None:
+        self._counts[name] = self._counts.get(name, 0) + 1
+
+
+def deployed_task_definitions(service: Mapping[str, Any]) -> List[str]:
+    """
+    :param service: One ``services`` item of DescribeServices.
+    :return: The task definitions it runs or may go back to: its own, and those of its PRIMARY and ACTIVE deployments
+        and task sets. A service scaled to zero has its deployments too.
+    """
+    arns = [service.get("taskDefinition")]
+    for item in list(service.get("deployments") or ()) + list(
+        service.get("taskSets") or ()
+    ):
+        if item.get("status") in DEPLOYED_STATUSES:
+            arns.append(item.get("taskDefinition"))
+    return list(dict.fromkeys(arn for arn in arns if arn))
+
+
+def repository_policy_gaps(text: Optional[str], registry_id: str) -> List[str]:
+    """
+    Who outside the account the repository's policy lets pull, as far as the job can't prove otherwise.
+
+    A statement lets pull when it allows ``ecr:BatchGetImage`` or ``ecr:GetDownloadUrlForLayer``, by name, by a
+    wildcard, or by a NotAction that leaves one of them out. Then the view is incomplete if it allows any principal
+    the job can't prove is this account: another account; ``*``; NotPrincipal; a principal it can't read; an
+    organization condition; a service principal other than Lambda acting for this account's functions.
+
+    :param text: The policy, as GetRepositoryPolicy gives it; None if the repository has none.
+    :param registry_id: This account.
+    :return: Why the view is incomplete; empty if no one outside the account may pull.
+    :raise RepositoryError: if the policy isn't a JSON object.
+    """
+    if text is None:
+        return []
+    try:
+        document = json.loads(text)
+    except ValueError as err:
+        raise RepositoryError(f"The repository's policy isn't JSON: {err}") from err
+    if not isinstance(document, dict):
+        raise RepositoryError("The repository's policy isn't a JSON object.")
+    statements = document.get("Statement") or []
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list):
+        return ["repository policy has a Statement the job can't read"]
+    gaps: List[str] = []
+    for statement in statements:
+        try:
+            gaps.extend(_statement_gaps(statement, registry_id))
+        except _UnreadablePolicy as err:
+            gaps.append(f"repository policy has a statement the job can't read: {err}")
+    return list(dict.fromkeys(gaps))
+
+
+@dataclass(frozen=True)
 class Verdict:
     """
     What the job decided about one unit.
@@ -478,12 +893,14 @@ class Verdict:
     :param last_in_use_at: The latest ``lastInUseAt`` Inspector gave for its manifests.
     :param in_use_count: The highest ``inUseCount`` Inspector gave for its manifests.
     :param last_pulled_at: The latest pull ECR recorded for its runnable manifests.
-    :param use_judged_by: How its use was judged: by Inspector, by ECR's pull record, or unknown. None if it has no
-        runnable manifest.
+    :param use_judged_by: How its use was judged: by ECS or Lambda (the first of the two that runs it), by Inspector,
+        by ECR's pull record, or unknown. None if it has no runnable manifest and nothing runs it.
     :param never_pulled: True if its use was judged from ECR's pull record, and ECR recorded no pull of any of its
         runnable manifests.
-    :param never_pulled_digests: Its runnable manifests judged never pulled: those whose judgement rests on ECR's
-        answer having no pull time.
+    :param runnable_digests: Its runnable manifests: the platform images, or the single manifest. Their pull records
+        are what the job reads again before deleting.
+    :param in_use_by: The ECS and Lambda uses that name one of its digests or tags.
+    :param in_use_sources: What shows it in use: ``ecs``, ``lambda``, ``inspector``, ``ecr_pull_record``.
     """
 
     unit: Unit
@@ -496,7 +913,9 @@ class Verdict:
     last_pulled_at: Optional[datetime]
     use_judged_by: Optional[str]
     never_pulled: bool
-    never_pulled_digests: Tuple[str, ...]
+    runnable_digests: Tuple[str, ...] = ()
+    in_use_by: Tuple[Use, ...] = ()
+    in_use_sources: FrozenSet[str] = frozenset()
 
     @property
     def is_vulnerable(self) -> bool:
@@ -525,6 +944,7 @@ class Verdict:
             "last_pulled_at": _iso(self.last_pulled_at),
             "use_judged_by": self.use_judged_by,
             "never_pulled": self.never_pulled,
+            "in_use_by": [use.describe() for use in self.in_use_by],
             "vulnerabilities": list(self.vulnerabilities),
         }
 
@@ -569,30 +989,40 @@ class Plan:
     :param deletions: The units to delete, oldest first, up to the cap.
     :param left_by_cap: The candidates the cap leaves for a later run.
     :param manifests_seen: How many manifests the repository holds.
-    :param pulled_on_recheck: The manifests judged never pulled that a read before deleting showed a pull of.
+    :param view: What ECS and Lambda say runs, and whether the view is complete.
+    :param pulled_on_recheck: The candidates' manifests that a read before deleting showed a newer pull of.
+    :param dropped_on_recheck: The candidates the reads before deleting showed in use: their roots.
     """
 
     verdicts: Tuple[Verdict, ...]
     deletions: Tuple[Deletion, ...]
     left_by_cap: Tuple[Verdict, ...]
     manifests_seen: int
+    view: Runtime = field(default_factory=Runtime)
     pulled_on_recheck: Tuple[str, ...] = ()
+    dropped_on_recheck: Tuple[str, ...] = ()
 
     @property
-    def never_pulled_digests(self) -> List[str]:
+    def candidates(self) -> List[Verdict]:
         """
-        :return: The manifests judged never pulled in every candidate, the cap's leftovers included, once each: what
-            the job reads again before deleting. A pull a read finds can only protect more, so the candidates after
-            it are among these.
+        :return: Every candidate, those the cap leaves included, oldest first.
         """
-        candidates = [deletion.verdict for deletion in self.deletions] + list(
+        return [deletion.verdict for deletion in self.deletions] + list(
             self.left_by_cap
         )
+
+    @property
+    def recheck_digests(self) -> List[str]:
+        """
+        :return: The runnable manifests of every candidate, the cap's leftovers included, once each: whose pull records
+            the job reads again before deleting. A pull a read finds, or a task it shows, can only protect more, so
+            the candidates after it are among these.
+        """
         return list(
             dict.fromkeys(
                 digest
-                for verdict in candidates
-                for digest in verdict.never_pulled_digests
+                for verdict in self.candidates
+                for digest in verdict.runnable_digests
             )
         )
 
@@ -624,7 +1054,16 @@ class Plan:
                 for reason in REASONS
             },
             "judged_never_pulled": sum(verdict.never_pulled for verdict in vulnerable),
+            # Of every image seen, vulnerable or not: what each source shows in use.
+            "images_in_use_by": {
+                source: sum(
+                    source in verdict.in_use_sources for verdict in self.verdicts
+                )
+                for source in USE_SOURCES
+            },
+            "view": self.view.describe(),
             "pulled_on_recheck": len(self.pulled_on_recheck),
+            "dropped_on_recheck": len(self.dropped_on_recheck),
             "candidates": len(self.deletions) + len(self.left_by_cap),
             "deleted": 0 if settings.dry_run else len(self.deletions),
             "would_delete": len(self.deletions) if settings.dry_run else 0,
@@ -681,6 +1120,7 @@ def judge(
     repository: Repository,
     unit: Unit,
     evidence: Evidence,
+    view: Runtime,
     settings: Settings,
     rollback_kept: Set[str],
     now: datetime,
@@ -691,6 +1131,7 @@ def judge(
     :param repository: The repository.
     :param unit: The unit.
     :param evidence: What Inspector says.
+    :param view: What ECS and Lambda say runs.
     :param settings: The job's settings.
     :param rollback_kept: The rollback candidates the lifecycle keeps.
     :param now: The time of the run.
@@ -730,20 +1171,31 @@ def judge(
     pulls = [
         image.last_pulled_at for image in runnable if image.last_pulled_at is not None
     ]
+    # What ECS and Lambda run, or would start: a digest of any of its manifests (ECS gives the index's), or a tag.
+    in_use_by = tuple(sorted(view.uses_of(images), key=lambda use: use.sort_key))
+    sources = {use.source for use in in_use_by}
     if any(count > 0 for count in in_use_counts) or any(
-        moment >= soak_start for moment in last_uses + pulls
+        moment >= soak_start for moment in last_uses
     ):
+        sources.add(JUDGED_BY_INSPECTOR)
+    if any(moment >= soak_start for moment in pulls):
+        sources.add(JUDGED_BY_PULL_RECORD)
+    if sources:
         reasons.add(IN_USE)
     # Fail closed: the use of every manifest a container could run must be judged, by Inspector or by ECR's pull
-    # record. A unit is unknown when any of them is.
+    # record, unless ECS or Lambda runs the unit. A unit is unknown when any of them is.
     use_by_digest = {
-        image.digest: _judge_use(image, evidence, soak_start) for image in runnable
+        image.digest: _judge_use(image, evidence, soak_start, view.complete)
+        for image in runnable
     }
     uses = set(use_by_digest.values())
-    if _UNKNOWN in uses:
+    use_judged_by: Optional[str]
+    if in_use_by:
+        use_judged_by = JUDGED_BY_ECS if JUDGED_BY_ECS in sources else JUDGED_BY_LAMBDA
+    elif _UNKNOWN in uses:
         reasons.add(IN_USE_UNKNOWN)
-        use_judged_by: Optional[str] = JUDGED_UNKNOWN
-    elif uses & {_NEVER_PULLED, _PULLED_WITHIN_SOAK}:
+        use_judged_by = JUDGED_UNKNOWN
+    elif uses & _BY_PULL_RECORD:
         use_judged_by = JUDGED_BY_PULL_RECORD
     elif uses:
         use_judged_by = JUDGED_BY_INSPECTOR
@@ -765,27 +1217,32 @@ def judge(
         last_pulled_at=max(pulls, default=None),
         use_judged_by=use_judged_by,
         never_pulled=use_judged_by == JUDGED_BY_PULL_RECORD and not pulls,
-        never_pulled_digests=tuple(
-            digest for digest, use in use_by_digest.items() if use == _NEVER_PULLED
-        ),
+        runnable_digests=tuple(image.digest for image in runnable),
+        in_use_by=in_use_by,
+        in_use_sources=frozenset(sources),
     )
 
 
 def plan(
-    repository: Repository, evidence: Evidence, settings: Settings, now: datetime
+    repository: Repository,
+    evidence: Evidence,
+    view: Runtime,
+    settings: Settings,
+    now: datetime,
 ) -> Plan:
     """
     Judge every unit and order the deletions.
 
     :param repository: The repository.
     :param evidence: What Inspector says.
+    :param view: What ECS and Lambda say runs.
     :param settings: The job's settings.
     :param now: The time of the run.
     :return: The plan.
     """
     rollback_kept = rollback_candidates_kept(repository.images.values(), settings, now)
     verdicts = tuple(
-        judge(repository, unit, evidence, settings, rollback_kept, now)
+        judge(repository, unit, evidence, view, settings, rollback_kept, now)
         for unit in repository.units
     )
     candidates = sorted(
@@ -831,6 +1288,7 @@ def plan(
         deletions=tuple(deletions),
         left_by_cap=tuple(candidates[settings.max_deletions :]),
         manifests_seen=len(repository.images),
+        view=view,
     )
 
 
@@ -846,14 +1304,17 @@ def parse_manifest(text: str) -> Dict[str, Any]:
     return manifest
 
 
-def _judge_use(image: Image, evidence: Evidence, soak_start: datetime) -> str:
+def _judge_use(
+    image: Image, evidence: Evidence, soak_start: datetime, view_complete: bool
+) -> str:
     """
-    How the use of one runnable manifest is judged.
+    How the use of one runnable manifest is judged, when ECS and Lambda run nothing of its unit.
 
     :param image: A platform image or a single manifest.
     :param evidence: What Inspector says.
     :param soak_start: The start of the soak.
-    :return: By Inspector, never pulled, pulled within the soak, or unknown.
+    :param view_complete: True if ECS and Lambda were read in full and no one outside the account may pull.
+    :return: By Inspector, never pulled, pulled within the soak, pulled before it, or unknown.
     """
     coverage = evidence.coverage.get(image.digest, ())
     if _usage_known(coverage):
@@ -873,8 +1334,178 @@ def _judge_use(image: Image, evidence: Evidence, soak_start: datetime) -> str:
         return _UNKNOWN
     if image.last_pulled_at >= soak_start:
         return _PULLED_WITHIN_SOAK
-    # Pulled before the soak: a task that pulled it then may still run it, and nothing here can tell.
+    # Pulled before the soak. With the whole view, nothing that runs it went unseen: no ECS task or deployment, no
+    # Lambda version names it, and no other account may pull it. Without, a task that pulled it then may still run it.
+    if view_complete:
+        return _PULLED_BEFORE_SOAK
     return _UNKNOWN
+
+
+class _UnreadablePolicy(ValueError):
+    """A repository policy statement in a shape the job can't read."""
+
+
+def _statement_gaps(statement: Any, registry_id: str) -> List[str]:
+    """
+    :param statement: One statement of a repository policy.
+    :param registry_id: This account.
+    :return: Who outside the account it lets pull.
+    :raise _UnreadablePolicy: if it isn't shaped as IAM documents it.
+    """
+    if not isinstance(statement, dict):
+        raise _UnreadablePolicy("not an object")
+    if statement.get("Effect") != "Allow" or not _allows_pull(statement):
+        return []
+    name = f"statement {statement['Sid']!r}" if statement.get("Sid") else "a statement"
+    condition = statement.get("Condition") or {}
+    if not isinstance(condition, dict):
+        raise _UnreadablePolicy(f"{name}'s Condition isn't an object")
+    gaps = [
+        f"repository policy allows an organization ({key} in {name})"
+        for operator in condition.values()
+        if isinstance(operator, dict)
+        for key in operator
+        if key.lower() in ORGANIZATION_KEYS
+    ]
+    if "NotPrincipal" in statement:
+        gaps.append(f"repository policy allows everyone but a NotPrincipal ({name})")
+    principal = statement.get("Principal")
+    if principal is None:
+        if "NotPrincipal" not in statement:
+            gaps.append(f"repository policy names no principal ({name})")
+        return gaps
+    if principal == "*":
+        return gaps + ["repository policy allows *"]
+    if not isinstance(principal, dict):
+        raise _UnreadablePolicy(f"{name}'s Principal isn't an object")
+    for kind, values in principal.items():
+        for value in _strings(values, f"{name}'s Principal"):
+            if kind == "AWS":
+                account = _principal_account(value)
+                if value == "*":
+                    gaps.append("repository policy allows *")
+                elif account is None:
+                    gaps.append(
+                        f"repository policy allows a principal the job can't place in an account: {value}"
+                    )
+                elif account != registry_id:
+                    gaps.append(f"repository policy allows account {account}")
+            elif kind == "Service" and value.lower() == "lambda.amazonaws.com":
+                if not _for_this_accounts_functions(condition, registry_id):
+                    gaps.append(
+                        "repository policy allows lambda.amazonaws.com for functions it doesn't prove are this "
+                        f"account's ({name})"
+                    )
+            elif kind == "Service":
+                gaps.append(f"repository policy allows service {value}")
+            else:
+                gaps.append(f"repository policy allows {kind} principal {value}")
+    return gaps
+
+
+def _allows_pull(statement: Mapping[str, Any]) -> bool:
+    """
+    :param statement: An Allow statement.
+    :return: True if it allows an action a pull needs: by name, by a wildcard, or by a NotAction that leaves it out.
+    """
+    if "NotAction" in statement:
+        excluded = _strings(statement["NotAction"], "NotAction")
+        return any(
+            not any(_action_matches(pattern, action) for pattern in excluded)
+            for action in PULL_ACTIONS
+        )
+    actions = _strings(statement.get("Action", []), "Action")
+    return any(
+        _action_matches(pattern, action)
+        for pattern in actions
+        for action in PULL_ACTIONS
+    )
+
+
+def _action_matches(pattern: str, action: str) -> bool:
+    """
+    :param pattern: An action in a policy, maybe with ``*`` and ``?``.
+    :param action: An action, in lowercase.
+    :return: True if IAM matches it: case-insensitively, wildcards included.
+    """
+    expression = "".join(
+        ".*" if char == "*" else "." if char == "?" else re.escape(char)
+        for char in pattern.lower()
+    )
+    return re.fullmatch(expression, action) is not None
+
+
+def _for_this_accounts_functions(
+    condition: Mapping[str, Any], registry_id: str
+) -> bool:
+    """
+    :param condition: A statement's Condition.
+    :param registry_id: This account.
+    :return: True if a condition limits Lambda to this account's functions: ``aws:SourceAccount`` this account, or
+        ``aws:SourceArn`` only this account's function ARNs, with no wildcard before the function's name.
+    """
+    for operator, entries in condition.items():
+        if operator not in _RESTRICTING_OPERATORS or not isinstance(entries, dict):
+            continue
+        for key, values in entries.items():
+            listed = _strings(values, f"{key}'s values")
+            if not listed:
+                continue
+            if (
+                key.lower() == "aws:sourceaccount"
+                and operator.startswith("String")
+                and all(value == registry_id for value in listed)
+            ):
+                return True
+            if key.lower() == "aws:sourcearn" and all(
+                _is_this_accounts_function(value, registry_id) for value in listed
+            ):
+                return True
+    return False
+
+
+def _is_this_accounts_function(arn: str, registry_id: str) -> bool:
+    parts = arn.split(":")
+    return (
+        len(parts) >= 7
+        and not any("*" in part or "?" in part for part in parts[:6])
+        and parts[0] == "arn"
+        and parts[2] == "lambda"
+        and parts[4] == registry_id
+        and parts[5] == "function"
+    )
+
+
+def _principal_account(value: str) -> Optional[str]:
+    """
+    :param value: An ``AWS`` principal: an account id, or an IAM or STS ARN.
+    :return: Its account, or None if the job can't tell.
+    """
+    if _ACCOUNT_ID.match(value):
+        return value
+    match = _PRINCIPAL_ARN.match(value)
+    return match["account"] if match else None
+
+
+def _strings(value: Any, what: str) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    raise _UnreadablePolicy(f"{what} isn't a string or a list of strings")
+
+
+def _union(
+    first: Mapping[str, FrozenSet[Use]], second: Mapping[str, FrozenSet[Use]]
+) -> Dict[str, FrozenSet[Use]]:
+    merged = {key: frozenset(uses) for key, uses in first.items()}
+    for key, uses in second.items():
+        merged[key] = merged.get(key, frozenset()) | uses
+    return merged
+
+
+def _last_part(arn: str) -> str:
+    return arn.rsplit("/", 1)[-1]
 
 
 def _has_usage(record: Mapping[str, Any]) -> bool:

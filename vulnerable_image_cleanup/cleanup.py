@@ -1,9 +1,10 @@
 """
 Deletes the images of one ECR repository that Inspector reports vulnerable and that nothing protects.
 
-A run reads the repository and Inspector, decides (see ``selection``), reads again the images it judged never pulled,
-then deletes up to the cap, or in a dry run, only logs what it would delete. Any error from AWS, throttling that
-outlasts the retries, or a page it can't read fails the run before it deletes anything: the monitored Lambda alarms.
+A run reads the repository, Inspector, the repository's policy, and what ECS and Lambda run in the repository's account
+and Region; decides (see ``selection``); reads again the candidates' pull records and the running ECS tasks; then
+deletes up to the cap, or in a dry run, only logs what it would delete. Any error from AWS, throttling that outlasts
+the retries, or a page it can't read fails the run before it deletes anything: the monitored Lambda alarms.
 """
 
 from __future__ import annotations
@@ -12,24 +13,27 @@ import json
 import logging
 import os
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Mapping, Sequence
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 import selection
-from selection import Evidence, Plan, Repository, Settings
+from selection import Evidence, Plan, Repository, Runtime, RuntimeBuilder, Settings
 
 LOG = logging.getLogger()
 LOG.setLevel(logging.INFO)
 
 # Throttling and transient errors are retried; once the retries run out, the error fails the run.
 BOTO_CONFIG = Config(retries={"mode": "standard", "max_attempts": 10})
-# BatchGetImage and BatchDeleteImage take at most 100 image ids.
+# BatchGetImage and BatchDeleteImage take at most 100 image ids; ECS's DescribeTasks 100 tasks, DescribeServices 10
+# services.
 BATCH_SIZE = 100
+TASKS_BATCH_SIZE = 100
+SERVICES_BATCH_SIZE = 10
 ACCEPTED_MEDIA_TYPES = [
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -37,12 +41,16 @@ ACCEPTED_MEDIA_TYPES = [
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.docker.distribution.manifest.v1+prettyjws",
 ]
-# Botocore drops the fields its model doesn't know. Without these, every image would look unused or never pulled, or
-# the archived ones would stay hidden.
+# Botocore drops the fields its model doesn't know. Without these, every image would look unused or never pulled, the
+# archived ones would stay hidden, or what ECS and Lambda run would go unseen.
 REQUIRED_MODEL_FIELDS = {
     ("inspector2", "EcrContainerImageMetadata"): ("inUseCount", "lastInUseAt"),
     ("ecr", "DescribeImagesFilter"): ("imageStatus",),
     ("ecr", "ImageDetail"): ("imageStatus", "lastRecordedPullTime"),
+    ("ecs", "Container"): ("image", "imageDigest"),
+    ("ecs", "Service"): ("deployments", "taskSets", "taskDefinition"),
+    ("lambda", "FunctionConfiguration"): ("PackageType", "Version"),
+    ("lambda", "FunctionCodeLocation"): ("ImageUri", "ResolvedImageUri"),
 }
 # For about five minutes after an image's first pull shows, DescribeImages answers flap: in the test account, 22% to 60%
 # of reads lost the pull time, in runs of up to 18 s. So the images judged never pulled are read again before the job
@@ -69,6 +77,41 @@ class DeletionError(CleanupError):
         self.deleted = list(deleted)
 
 
+@dataclass(frozen=True)
+class Clients:
+    """
+    The AWS clients a run uses, all in the repository's account and Region.
+
+    :param ecr: ECR.
+    :param inspector: Inspector2.
+    :param ecs: ECS.
+    :param lambda_: Lambda.
+    """
+
+    ecr: Any
+    inspector: Any
+    ecs: Any
+    lambda_: Any
+
+    @classmethod
+    def in_region(cls, region: str) -> "Clients":
+        """
+        :param region: The repository's Region.
+        :return: The clients, with the retries of ``BOTO_CONFIG``.
+        """
+        return cls(
+            **{
+                name: boto3.client(service, region_name=region, config=BOTO_CONFIG)
+                for name, service in (
+                    ("ecr", "ecr"),
+                    ("inspector", "inspector2"),
+                    ("ecs", "ecs"),
+                    ("lambda_", "lambda"),
+                )
+            }
+        )
+
+
 def lambda_handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
     """
     The Lambda's entry point. The event is ignored: the schedule only triggers a run.
@@ -78,42 +121,39 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
     :return: The run's summary.
     """
     settings = Settings.from_environment(os.environ)
-    region = os.environ["REPOSITORY_REGION"]
-    return run(
-        settings,
-        boto3.client("ecr", region_name=region, config=BOTO_CONFIG),
-        boto3.client("inspector2", region_name=region, config=BOTO_CONFIG),
-        datetime.now(timezone.utc),
-    )
+    return run(settings, Clients.in_region(settings.region), datetime.now(timezone.utc))
 
 
-def run(settings: Settings, ecr: Any, inspector: Any, now: datetime) -> Dict[str, Any]:
+def run(settings: Settings, clients: Clients, now: datetime) -> Dict[str, Any]:
     """
     Read, decide, act.
 
     :param settings: The job's settings.
-    :param ecr: An ECR client in the repository's Region.
-    :param inspector: An Inspector2 client in the repository's Region.
+    :param clients: The clients, in the repository's Region.
     :param now: The time of the run.
     :return: The run's summary.
     :raise CleanupError: if the run can't read what it needs, or ECR refuses a deletion.
     """
-    check_models(ecr, inspector)
-    plan = decide(settings, ecr, inspector, now)
-    return execute(settings, ecr, plan)
+    check_models(clients)
+    plan = decide(settings, clients, now)
+    return execute(settings, clients.ecr, plan)
 
 
-def check_models(ecr: Any, inspector: Any) -> None:
+def check_models(clients: Clients) -> None:
     """
     Fail unless botocore's models have the fields the rules read.
 
-    :param ecr: An ECR client.
-    :param inspector: An Inspector2 client.
+    :param clients: The clients.
     :raise CleanupError: if a field is missing.
     """
-    clients = {"ecr": ecr, "inspector2": inspector}
+    by_service = {
+        "ecr": clients.ecr,
+        "inspector2": clients.inspector,
+        "ecs": clients.ecs,
+        "lambda": clients.lambda_,
+    }
     for (service, shape), fields in REQUIRED_MODEL_FIELDS.items():
-        members = clients[service].meta.service_model.shape_for(shape).members
+        members = by_service[service].meta.service_model.shape_for(shape).members
         missing = [name for name in fields if name not in members]
         if missing:
             raise CleanupError(
@@ -121,39 +161,167 @@ def check_models(ecr: Any, inspector: Any) -> None:
             )
 
 
-def decide(settings: Settings, ecr: Any, inspector: Any, now: datetime) -> Plan:
+def decide(settings: Settings, clients: Clients, now: datetime) -> Plan:
     """
-    Read the repository and Inspector, and decide.
+    Read the repository, Inspector, the repository's policy, ECS and Lambda, and decide.
 
     :param settings: The job's settings.
-    :param ecr: An ECR client.
-    :param inspector: An Inspector2 client.
+    :param clients: The clients.
     :param now: The time of the run.
     :return: The plan.
     """
-    details = read_images(settings, ecr)
-    repository = Repository.build(details, read_manifests(settings, ecr, details))
-    evidence = Evidence.build(
-        read_findings(settings, inspector), read_coverage(settings, inspector), settings
+    details = read_images(settings, clients.ecr)
+    repository = Repository.build(
+        details, read_manifests(settings, clients.ecr, details)
     )
-    plan = selection.plan(repository, evidence, settings, now)
-    # One answer without a pull time isn't enough to delete: read again every image the plan judged never pulled. A
-    # pull a read shows can only protect more, so judging again with it needs no further read.
-    digests = plan.never_pulled_digests
+    evidence = Evidence.build(
+        read_findings(settings, clients.inspector),
+        read_coverage(settings, clients.inspector),
+        settings,
+    )
+    view = read_view(settings, clients)
+    plan = selection.plan(repository, evidence, view, settings, now)
+    # One answer isn't enough to delete: read again the pull records of every candidate's runnable manifests, then the
+    # running ECS tasks, right before deleting, to catch a pull or a task that started during the run. What a read
+    # shows can only protect more, so judging again with it needs no further read.
+    digests = plan.recheck_digests
     if not digests:
         return plan
-    pulls = recheck_pulls(settings, ecr, digests)
+    pulls, tasks = recheck(settings, clients, digests)
+    # Only a pull newer than the first read's says something new.
+    newer = {
+        digest: moment
+        for digest, moment in pulls.items()
+        if repository.images[digest].last_pulled_at is None
+        or moment > repository.images[digest].last_pulled_at
+    }
+    rejudged = selection.plan(
+        repository.with_pulls(newer), evidence, view.merged(tasks), settings, now
+    )
+    still = {verdict.unit.root for verdict in rejudged.candidates}
+    dropped = tuple(
+        verdict.unit.root
+        for verdict in plan.candidates
+        if verdict.unit.root not in still
+    )
     _log(
         "recheck",
         settings,
         {
-            "never_pulled": digests,
-            "pulled": {digest: moment.isoformat() for digest, moment in pulls.items()},
+            "read_again": digests,
+            "pulled": {digest: moment.isoformat() for digest, moment in newer.items()},
+            "dropped": list(dropped),
         },
     )
-    if pulls:
-        plan = selection.plan(repository.with_pulls(pulls), evidence, settings, now)
-    return replace(plan, pulled_on_recheck=tuple(pulls))
+    return replace(rejudged, pulled_on_recheck=tuple(newer), dropped_on_recheck=dropped)
+
+
+def recheck(
+    settings: Settings, clients: Clients, digests: Sequence[str]
+) -> Tuple[Dict[str, datetime], Runtime]:
+    """
+    Read again, right before deleting: the pull records of the candidates' runnable manifests, then the running ECS
+    tasks.
+
+    :param settings: The job's settings.
+    :param clients: The clients.
+    :param digests: The candidates' runnable manifests.
+    :return: The latest pull time any read showed, by digest, and what the running tasks name.
+    """
+    pulls = recheck_pulls(settings, clients.ecr, digests)
+    builder = RuntimeBuilder(settings)
+    read_ecs(clients.ecs, builder, services=False)
+    return pulls, builder.build()
+
+
+def read_view(settings: Settings, clients: Clients) -> Runtime:
+    """
+    Read what can run the repository's images: the repository's policy, ECS and Lambda.
+
+    :param settings: The job's settings.
+    :param clients: The clients.
+    :return: The view.
+    """
+    builder = RuntimeBuilder(settings)
+    builder.add_repository_policy(read_repository_policy(settings, clients.ecr))
+    read_ecs(clients.ecs, builder, services=True)
+    read_lambda(clients.lambda_, builder)
+    return builder.build()
+
+
+def read_repository_policy(settings: Settings, ecr: Any) -> Optional[str]:
+    """
+    :param settings: The job's settings.
+    :param ecr: An ECR client.
+    :return: The repository's policy, or None if it has none.
+    """
+    try:
+        return ecr.get_repository_policy(
+            registryId=settings.registry_id, repositoryName=settings.repository_name
+        )["policyText"]
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == (
+            "RepositoryPolicyNotFoundException"
+        ):
+            return None
+        raise
+
+
+def read_ecs(ecs: Any, builder: RuntimeBuilder, services: bool) -> None:
+    """
+    Read every cluster's running tasks, and if asked, every service's deployed task definitions.
+
+    :param ecs: An ECS client.
+    :param builder: Where the uses go.
+    :param services: Read the services too.
+    :raise CleanupError: if ECS doesn't describe a task or service it listed.
+    """
+    deployed: Dict[str, List[Tuple[str, Mapping[str, Any]]]] = {}
+    for cluster in _paginate(ecs, "list_clusters", "clusterArns"):
+        builder.add_cluster()
+        task_arns = _paginate(
+            ecs, "list_tasks", "taskArns", cluster=cluster, desiredStatus="RUNNING"
+        )
+        for chunk in _chunks(task_arns, TASKS_BATCH_SIZE):
+            response = ecs.describe_tasks(cluster=cluster, tasks=list(chunk))
+            for task in _described(response, "tasks", "taskArn", chunk, "tasks"):
+                builder.add_task(cluster, task)
+        if not services:
+            continue
+        service_arns = _paginate(ecs, "list_services", "serviceArns", cluster=cluster)
+        for chunk in _chunks(service_arns, SERVICES_BATCH_SIZE):
+            response = ecs.describe_services(cluster=cluster, services=list(chunk))
+            for service in _described(
+                response, "services", "serviceArn", chunk, "services"
+            ):
+                builder.add_service()
+                for arn in selection.deployed_task_definitions(service):
+                    deployed.setdefault(arn, []).append((cluster, service))
+    for arn in sorted(deployed):
+        task_definition = ecs.describe_task_definition(taskDefinition=arn)[
+            "taskDefinition"
+        ]
+        builder.add_task_definition()
+        for cluster, service in deployed[arn]:
+            builder.add_deployment(cluster, service, task_definition)
+
+
+def read_lambda(lambda_: Any, builder: RuntimeBuilder) -> None:
+    """
+    Read the image of every version of every container image function: a rollback to a version runs its image.
+
+    :param lambda_: A Lambda client.
+    :param builder: Where the uses go.
+    """
+    for function in _paginate(
+        lambda_, "list_functions", "Functions", FunctionVersion="ALL"
+    ):
+        if function.get("PackageType") != "Image":
+            continue
+        code = lambda_.get_function(
+            FunctionName=function["FunctionName"], Qualifier=function["Version"]
+        )["Code"]
+        builder.add_function_version(function, code)
 
 
 def recheck_pulls(
@@ -372,6 +540,41 @@ def delete_images(settings: Settings, ecr: Any, digests: Sequence[str]) -> List[
 def _chunks(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+def _paginate(client: Any, operation: str, key: str, **params: Any) -> List[Any]:
+    """
+    :return: Every item of every page. A page that fails fails the read.
+    """
+    items: List[Any] = []
+    for page in client.get_paginator(operation).paginate(**params):
+        items.extend(page[key])
+    return items
+
+
+def _described(
+    response: Mapping[str, Any],
+    key: str,
+    arn_key: str,
+    asked: Sequence[str],
+    what: str,
+) -> List[Mapping[str, Any]]:
+    """
+    :param response: A DescribeTasks or DescribeServices answer.
+    :param key: Where its items are.
+    :param arn_key: Each item's ARN.
+    :param asked: The ARNs asked for.
+    :param what: What they are, for the error.
+    :return: The items.
+    :raise CleanupError: if ECS gives a failure, or leaves one out: what it runs would go unseen.
+    """
+    if response.get("failures"):
+        raise CleanupError(f"ECS didn't describe these {what}: {response['failures']}")
+    items = response[key]
+    missing = sorted(set(asked) - {item.get(arn_key) for item in items})
+    if missing:
+        raise CleanupError(f"ECS didn't describe the {what} {missing}")
+    return items
 
 
 def _equals(value: str) -> Dict[str, str]:
