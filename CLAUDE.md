@@ -48,16 +48,28 @@ are defined in `locals.tf` and merged onto the ECR repository.
 - **vulnerable_image_cleanup.tf**: with `count`, off by default
   (`vulnerable_image_cleanup_enabled`): `lambda-monitored` 2.2.1, its IAM
   policy (from a policy document), and an EventBridge rule, target and
-  Lambda permission for the schedule. `ecr:DescribeImages` and
-  `ecr:BatchGetImage` on the repository; `ecr:BatchDeleteImage` on it
-  only when `vulnerable_image_cleanup_dry_run` is false;
-  `inspector2:ListFindings` and `inspector2:ListCoverage` on `*`.
+  Lambda permission for the schedule. `ecr:DescribeImages`,
+  `ecr:BatchGetImage` and `ecr:GetRepositoryPolicy` on the repository;
+  `ecr:BatchDeleteImage` on it only when
+  `vulnerable_image_cleanup_dry_run` is false;
+  `inspector2:ListFindings` and `inspector2:ListCoverage` on `*`. ECS
+  and Lambda, read-only, in the repository's account and Region:
+  `ecs:ListClusters`, `ecs:DescribeTaskDefinition` and
+  `lambda:ListFunctions` on `*` (no resource type); `ecs:ListTasks` and
+  `ecs:ListServices` on `*` with `ecs:cluster` held to this account's
+  and Region's clusters; `ecs:DescribeTasks` and `ecs:DescribeServices`
+  on its tasks and services; `lambda:GetFunction` on its functions.
 - **vulnerable_image_cleanup/cleanup.py**: the handler and the AWS I/O:
-  reads ECR (every image, every index's manifest) and Inspector
-  (findings, coverage), decides, reads again the images judged never
-  pulled (`recheck_pulls`), then deletes or, dry, only logs.
+  reads ECR (every image, every index's manifest, the repository's
+  policy), Inspector (findings, coverage), ECS (every cluster's running
+  tasks, every service's deployed task definitions) and Lambda (every
+  version of every container image function); decides; reads again
+  the candidates' pull records and the running tasks (`recheck`); then
+  deletes or, dry, only logs.
 - **vulnerable_image_cleanup/selection.py**: the rules, as pure Python
-  over botocore-shaped answers.
+  over botocore-shaped answers: the view of what runs (`Runtime`,
+  `RuntimeBuilder`) and the repository policy's gaps
+  (`repository_policy_gaps`) included.
 - **vulnerable_image_cleanup/requirements.txt**: `boto3 ~= 1.41`, the
   first release whose botocore models Inspector's `inUseCount` and
   `lastInUseAt` and ECR's `imageStatus`. Botocore drops fields its model
@@ -72,17 +84,35 @@ The rules, which must stay right:
   keeps (same prefix, count and days as `policy.tf`, push time newest
   first, retained images counted, ACTIVE images only, either rule
   keeping), while `vulnerable_image_cleanup_protect_rollback_candidates`;
-  in use (`inUseCount` > 0, or `lastInUseAt` or ECR's
-  `lastRecordedPullTime` of a platform image or single manifest within
-  the soak); pushed within the least age; not ACTIVE; use unknown.
+  in use (ECS or Lambda runs it; `inUseCount` > 0, or `lastInUseAt` or
+  ECR's `lastRecordedPullTime` of a platform image or single manifest
+  within the soak); pushed within the least age; not ACTIVE; use
+  unknown.
+- In use by ECS or Lambda (`use_judged_by` `ecs` or `lambda`, the
+  uses in `in_use_by`): a running ECS task (any cluster; its
+  `imageDigest`, the index's in production, or its reference), the task
+  definition of a service's PRIMARY or ACTIVE deployment or task set
+  (scaled to zero too), or any version of a container image function
+  (`ResolvedImageUri`; `ImageUri` only without a digest). A digest
+  protects the unit whichever member it names, from any repository's
+  reference; a tag only from a reference to this repository (account,
+  Region, name; FIPS and dual-stack hosts too). No EKS: not read, not
+  detected (Aleks, 2026-11-23).
 - Use is judged per runnable manifest (a platform image or single
   manifest; never an index's own pull time, as ECR records the job's
   BatchGetImage of an index as a pull, nor an attestation's):
   Inspector's in-use data, both fields, judged as before; part of it,
   unknown; none (no coverage record, or neither field): ECR's pull
   record. Never pulled means never run, so not in use (`never_pulled`);
-  pulled within the soak, in use; pulled before it, unknown, as a
-  long-running task may still run it. Pushed before `PULL_RECORD_START`
+  pulled within the soak, in use; pulled before it, not in use when the
+  view is complete, unknown otherwise, as a long-running task in
+  another account may still run it. The view is complete when every
+  read finished and the repository's policy lets no one outside the
+  account pull (another account, `*`, `NotPrincipal`, an organization
+  key, an unplaceable principal, a service other than Lambda, or Lambda
+  not held to this account's functions by `aws:SourceArn` or
+  `aws:SourceAccount`, each make it incomplete). Pushed before
+  `PULL_RECORD_START`
   (2022-03-03; AWS's release note of 2022-03-02 in botocore 1.24.11's
   changelog) and never pulled: unknown. A unit is unknown when any of
   its runnable manifests is. A shared manifest has one pull record,
@@ -92,12 +122,14 @@ The rules, which must stay right:
 - Read again before deleting: DescribeImages answers flap for about five
   minutes after a first pull shows (in the test account, 22% to 60% of
   reads lost it, in runs of up to 18 s). So `decide` reads every
-  candidate's never-pulled manifests again, the cap's leftovers
-  included, `RECHECK_READS` (13) times, `RECHECK_INTERVAL` (10 s) apart,
-  and judges again with any pull it finds; a found pull only adds
-  protection, so one round is enough. Dry runs read again too.
+  candidate's runnable manifests again, the cap's leftovers included,
+  `RECHECK_READS` (13) times, `RECHECK_INTERVAL` (10 s) apart, then the
+  running ECS tasks, and judges again with any newer pull and every
+  use either read of the tasks showed; that only adds protection, so
+  one round is enough. Dry runs read again too.
 - Fail closed: any API error, failed page or unreadable manifest raises
-  before a deletion. ECR's `ImageReferencedByManifestList` or any other
+  before a deletion, in the reads of the policy, ECS and Lambda too, and
+  so does a task or service ECS lists but doesn't describe. ECR's `ImageReferencedByManifestList` or any other
   refusal (but `ImageNotFound`) fails the run, after a `delete_failed`
   line names the digests ECR deleted (`DeletionError.deleted`).
 - Deletion order: the index alone, then its manifests that no index
@@ -150,8 +182,15 @@ The vulnerable image cleanup's tests:
   such as a delete in a dry run.
 - `tests/test_vulnerable_image_cleanup_dry_run.py`
   (`test_data/vulnerable_image_cleanup_dry_run/`): on and dry, a
-  repository with nothing vulnerable; reads the role's policies, and
-  checks the function's reads record a pull of the indexes only.
+  repository with nothing vulnerable, an ECS service scaled to zero
+  naming an image by tag, and a container image function the test makes
+  (version 1 and `$LATEST` on two images); checks the deployed function
+  reads ECS and Lambda under its role and sees both, that a repository
+  policy letting another account pull makes the view incomplete, the
+  role's policies (DescribeTasks's scope through IAM's simulator, as no
+  task runs), and that the function's reads record a pull of the
+  indexes only. Ageing a pull past the soak can't be done in a test:
+  that path is the unit tests'.
 - `tests/test_vulnerable_image_cleanup_e2e.py`
   (`test_data/vulnerable_image_cleanup_e2e/`): needs `docker buildx`;
   pushes images from an old Debian base, pulls one with `docker pull`,

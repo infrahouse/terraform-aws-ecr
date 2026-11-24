@@ -130,15 +130,23 @@ All in `vulnerable_image_cleanup.tf`, each with `count`, so none of it exists wh
   [terraform-aws-s3-bucket](https://github.com/infrahouse/terraform-aws-s3-bucket), that holds the package; the log
   group, `/aws/lambda/<function name>`, kept 365 days; an SNS topic that emails
   `vulnerable_image_cleanup_alarm_emails`; an alarm on any error, and one on throttling.
-- **An IAM policy** for the function's role:
-    - `ecr:DescribeImages` and `ecr:BatchGetImage` on this repository;
+- **An IAM policy** for the function's role, read-only but for the delete:
+    - `ecr:DescribeImages`, `ecr:BatchGetImage` and `ecr:GetRepositoryPolicy` on this repository;
     - `ecr:BatchDeleteImage` on this repository, only when `vulnerable_image_cleanup_dry_run` is false;
-    - `inspector2:ListFindings` and `inspector2:ListCoverage`, which take no resource ARN.
+    - `inspector2:ListFindings` and `inspector2:ListCoverage`, which take no resource ARN;
+    - `ecs:ListClusters` and `ecs:DescribeTaskDefinition`, which take no resource ARN;
+    - `ecs:ListTasks` and `ecs:ListServices` on `*`, held by the `ecs:cluster` key to the clusters of the
+      repository's account and Region: ListServices names no resource type, and ListTasks names the container
+      instance, which a cluster without instances has none of;
+    - `ecs:DescribeTasks` on the tasks, and `ecs:DescribeServices` on the services, of the repository's account and
+      Region;
+    - `lambda:ListFunctions`, which takes no resource ARN, and `lambda:GetFunction` on the functions, and their
+      versions, of the repository's account and Region.
 - **An EventBridge rule** on `vulnerable_image_cleanup_schedule`, its target, and the permission that lets EventBridge
   invoke the function.
 
-The module passes its inputs to the function as environment variables. The function reads ECR and Inspector in the
-repository's Region, taken from the repository's ARN.
+The module passes its inputs to the function as environment variables. The function reads ECR, Inspector, ECS and
+Lambda in the repository's account and Region, taken from the repository's ARN.
 
 ### One Run
 
@@ -146,25 +154,34 @@ repository's Region, taken from the repository's ARN.
 
 1. **EventBridge invokes the function.** The event carries nothing the function reads.
 2. **It reads.** First it checks that the packaged botocore models the fields it judges by (Inspector's `inUseCount`
-   and `lastInUseAt`, ECR's `imageStatus` and `lastRecordedPullTime`): botocore drops fields its model lacks. Then:
+   and `lastInUseAt`, ECR's `imageStatus` and `lastRecordedPullTime`, and those of ECS and Lambda that name what runs):
+   botocore drops fields its model lacks. Then:
     - ECR's `DescribeImages`: every image, tagged or not, archived ones included;
     - ECR's `BatchGetImage`: the manifest of every index, and of any image whose media type ECR doesn't give, to know
       which manifests an index references;
     - Inspector's `ListFindings`: the ACTIVE findings on this repository's images, at or above
       `vulnerable_image_cleanup_min_severity`, with a fix available;
-    - Inspector's `ListCoverage`: each image's in-use data.
+    - Inspector's `ListCoverage`: each image's in-use data;
+    - ECR's `GetRepositoryPolicy`: whether anyone outside the account may pull. None is fine;
+    - ECS's `ListClusters`, `ListTasks` and `DescribeTasks`: every cluster's running tasks, and each container's
+      image and digest;
+    - ECS's `ListServices`, `DescribeServices` and `DescribeTaskDefinition`: every service's PRIMARY and ACTIVE
+      deployments and task sets, and the images their task definitions name, scaled to zero or not;
+    - Lambda's `ListFunctions` (every version) and `GetFunction`: the image each version of each container image
+      function runs.
 
     The function checks each finding and coverage record again itself: its status, severity, fix, account and
-    repository.
+    repository. Every page of every list is read.
 3. **It decides.** An index and the manifests it references (its platform images and its attestation) are one image:
    judged, capped and deleted together. A vulnerable image that nothing protects is a candidate. The candidates are
    ordered oldest first; the first `vulnerable_image_cleanup_max_deletions` are deleted in this run and the rest are
    left for the next.
-4. **It reads again** the manifests it judged never pulled, in every candidate, those the cap leaves included: 13
+4. **It reads again** the pull records of every candidate's platform images, those the cap leaves included: 13
    reads, 10 seconds apart, about two minutes. For about five minutes after a first pull shows, ECR's
-   `DescribeImages` answers flap: one read shows the pull time, the next may not. If any read shows a pull, the function
-   judges again with it. A pull only adds protection, so one round is enough. Dry runs read again too, and each run
-   that does logs a `recheck` line.
+   `DescribeImages` answers flap: one read shows the pull time, the next may not. Then it reads the running ECS tasks
+   again, to catch a task that started during the run. If a read shows a newer pull, or a task that runs a candidate,
+   the function judges again with it and drops that candidate. What a read shows only adds protection, so one round
+   is enough. Dry runs read again too, and each run that does logs a `recheck` line.
 5. **It acts.** In a dry run, it logs a `would_delete` line per image and deletes nothing. Otherwise it deletes each
    image in order: the index alone first, then the manifests it referenced that no index still in the repository
    references, level by level. Every run logs a `kept` line per vulnerable image something protects, a `left_by_cap`
@@ -185,9 +202,11 @@ manifest it references. Each kept image's log line lists its reasons:
   images counted, the first `rollback_candidate_retain_count`; or those pushed within
   `rollback_candidate_retain_days`. With neither set, the policy has no rollback candidate rule, and nothing is
   protected as one.
-- **`in_use`**: Inspector counts a running ECS task or EKS pod that uses it (`inUseCount` above 0), or saw it in use
-  within `vulnerable_image_cleanup_soak_days` (`lastInUseAt`). Or ECR recorded a pull of one of its platform images,
-  or of a single-manifest image, within the soak (`lastRecordedPullTime`).
+- **`in_use`**: ECS or Lambda runs it: a running task, the task definition of a service's deployment, or a version
+  of a container image function names one of its digests, or one of its tags in this repository. Or Inspector counts
+  something that runs it (`inUseCount` above 0), or saw it in use within `vulnerable_image_cleanup_soak_days`
+  (`lastInUseAt`). Or ECR recorded a pull of one of its platform images, or of a single-manifest image, within the
+  soak (`lastRecordedPullTime`).
 - **`in_use_unknown`**: the function can't tell whether it is in use. See [How It Judges Use](#how-it-judges-use).
 - **`recent`**: it was pushed within `vulnerable_image_cleanup_min_age_days`, so an image waiting for its pin isn't
   deleted.
@@ -201,7 +220,22 @@ When two indexes share a platform image and only one is kept, the other index is
 
 ### How It Judges Use
 
-Use is judged per runnable manifest: a platform image, or a single-manifest image. An index's own pull time doesn't
+**First, what ECS and Lambda run.** An image is in use when one of these names one of its digests, or one of its tags
+in this repository:
+
+- **a running ECS task**, in any cluster. ECS reports the digest it resolved, the index's when the image is one, and a
+  container still pending names the image by its reference;
+- **the task definition of an ECS service's deployment**: its PRIMARY and ACTIVE deployments and task sets, so a
+  service scaled to zero, one mid-deployment and one rolling back are seen. By tag, it protects the image with that
+  tag; by digest, that digest;
+- **a version of a container image Lambda function**, every version and not only `$LATEST`, as a rollback to a version
+  runs its image. Lambda runs the digest it resolved when the version was deployed (`ResolvedImageUri`).
+
+Whichever manifest a digest names, it protects the whole image. A tag in another repository, account or Region, though
+it is the same tag, protects nothing here. The log line says what runs it (`in_use_by`): the cluster and service, or
+the task, or the function and version.
+
+**Otherwise, per runnable manifest:** a platform image, or a single-manifest image. An index's own pull time doesn't
 count: the function reads every index with `BatchGetImage` each run, and ECR records that read as a pull. An
 attestation's doesn't either: a pull that fetches the attestation fetches the platform image too, and a tool such as a
 scanner may fetch the attestation alone.
@@ -212,15 +246,37 @@ For each runnable manifest:
   data.
 - **Inspector gives part of its in-use data:** unknown.
 - **Inspector gives none, and ECR recorded a pull within the soak:** in use.
-- **Inspector gives none, and ECR recorded a pull before the soak:** unknown. A long-running task that pulled it then
-  may still run it.
-- **Inspector gives none, ECR recorded no pull, and it was pushed on or after 2022-03-03:** never pulled, so never run:
-  not in use.
+- **Inspector gives none, ECR recorded a pull before the soak, and the view is complete:** not in use. Nothing in ECS
+  or Lambda runs it, and no one outside the account may pull it.
+- **Inspector gives none, ECR recorded a pull before the soak, and the view isn't complete:** unknown. A long-running
+  task in another account that pulled it then may still run it.
+- **Inspector gives none, ECR recorded no pull, and it was pushed on or after 2022-03-03:** never pulled, so never run,
+  here or in another account: not in use.
 - **Inspector gives none, ECR recorded no pull, and it was pushed before 2022-03-03:** unknown. AWS released ECR's
   pull time on 2022-03-02, so it may have been pulled without a record.
 
-An image is `in_use_unknown` when any of its runnable manifests is unknown. Inspector leaves both in-use fields out for
-an image it has never seen in use, and some accounts get them for no image at all; then the pull record decides.
+An image is `in_use_unknown` when any of its runnable manifests is unknown, and nothing in ECS or Lambda runs it.
+Inspector leaves both in-use fields out for an image it has never seen in use, and some accounts get them for no image
+at all; then the pull record decides.
+
+**The view is complete** when every read of ECS, Lambda and the repository's policy finished (a read that fails fails
+the run), and the repository's policy lets no one outside the account pull. A statement lets pull when it allows
+`ecr:BatchGetImage` or `ecr:GetDownloadUrlForLayer`, by name, by a wildcard, or by a `NotAction` that leaves one out.
+Then any of these makes the view incomplete: another account; `*`; `NotPrincipal`; a principal the function can't
+place in an account; an organization condition; a service other than Lambda; Lambda without a condition that holds it
+to this account's functions (`aws:SourceArn` or `aws:SourceAccount`, as the statement Lambda adds to a repository for
+its functions has). The summary's `view` says whether it was complete, and why not.
+
+What the function doesn't see:
+
+- EKS;
+- Docker run directly on EC2;
+- an ECS task started by a schedule or by hand, outside a service: it sees one only while it runs;
+- CodeBuild and App Runner;
+- other Regions.
+
+Nor something outside the account that pulls with a role of this account: the policy can't tell it from this account.
+Put any tag such a thing pins in `retain_tags`.
 
 Inspector's scans record no pull. The function's own reads record one on what they read with `BatchGetImage`: every
 index, and any manifest whose media type ECR doesn't give. Such a manifest then looks pulled, and is kept.
@@ -239,7 +295,9 @@ What ECR's pull record doesn't show, so every tag that something pins belongs in
 When the function can't judge, it deletes nothing:
 
 - An API error, throttling that outlasts botocore's retries (standard mode, 10 attempts), or a page it can't read
-  fails the run before any deletion.
+  fails the run before any deletion: in the reads of ECR, Inspector, the repository's policy, ECS and Lambda, and in
+  the reads again before deleting.
+- So does a task or service ECS listed and doesn't describe.
 - So does a manifest ECR doesn't return, an index that lists no manifests, or a botocore model without the fields
   above.
 - A deletion ECR refuses fails the run, unless the image is already gone (`ImageNotFound`). ECR refuses to delete a

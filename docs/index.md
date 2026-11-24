@@ -23,11 +23,37 @@ inputs, in an order that protects what runs:
   Add a retained tag, and the other rules move down without renumbering.
 - **Vulnerable image cleanup.** Inspector reports vulnerabilities in every image it monitors, used or not. A daily
   Lambda deletes the vulnerable images that nothing protects. It keeps the retained images and the rollback candidates
-  the lifecycle policy keeps, what runs or ran recently, what was pushed recently, and anything whose use it can't
-  judge. It runs dry until you turn deletion on, and fails closed.
+  the lifecycle policy keeps, what ECS and Lambda run, what ran recently, what was pushed recently, and anything whose
+  use it can't judge. It runs dry until you turn deletion on, and fails closed.
 
 The module creates the repository and its lifecycle policy, and the cleanup when it is on. It sets no repository
 policy, replication, scanning or encryption options.
+
+## What the Cleanup Sees
+
+The cleanup keeps what runs. What it sees, in the repository's account and Region:
+
+- **Inspector's in-use data.**
+- **ECR's pull record.**
+- **ECS's running tasks and services:** every cluster's running tasks, and the task definitions of every service's
+  PRIMARY and ACTIVE deployments and task sets, so a service scaled to zero, mid-deployment or rolling back is
+  seen.
+- **Lambda's versions:** every version of every container image function, not only `$LATEST`.
+
+What it doesn't see:
+
+- EKS;
+- Docker run directly on EC2;
+- an ECS task started by a schedule or by hand, outside a service (it sees one only while it runs);
+- CodeBuild and App Runner;
+- other Regions.
+
+What to do about it: put any tag such a thing pins in `retain_tags`.
+
+**Other accounts:** the job detects them through the repository policy, and keeps pulled images. An image ECR recorded
+a pull of before the soak, that nothing in ECS or Lambda runs, is deleted only when the repository's policy lets no
+one outside the account pull. Something outside the account that pulls with a role of this account looks like this
+account to the policy: put the tags it pins in `retain_tags` too.
 
 ## Features
 
