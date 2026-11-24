@@ -4,10 +4,13 @@ and its role can't delete. Its reads record a pull of each index it reads, and o
 image whose platform image or single manifest ECR never recorded a pull of as never run, so its own reads mustn't
 record one there.
 
-It reads what ECS and Lambda run, under its own role: an ECS service scaled to zero whose task definition names an
-image by tag, with its service revision, and a container image function whose version 1 runs one pushed image and
-whose $LATEST runs another. Then a repository policy that lets another account pull makes its view incomplete. The
-test account has no registry policy, which is account-wide, so the test sets none: the unit tests judge one.
+It reads what ECS and Lambda run, under its own role: two ECS services scaled to zero whose task definitions each name
+an image by tag, with their service revisions, and a container image function whose version 1 runs one pushed image
+and whose $LATEST runs another. ECS refuses a DescribeServiceRevisions or DescribeServiceDeployments request whose ARNs
+belong to more than one service, as 1.1.0 sent here for revisions: each service's are described on their own. The
+services show no current deployment, so the test reads their deployments with the function's code itself. Then a
+repository policy that lets another account pull makes its view incomplete. The test account has no registry policy,
+which is account-wide, so the test sets none: the unit tests judge one.
 """
 
 import base64
@@ -212,7 +215,7 @@ def test_dry_run_in_a_clean_repository(
             other["index"]: "other index, which the ECS service names by tag",
             other["platform"]: "other platform image, which alias shares",
             other["attestation"]: "other attestation",
-            alias: "alias index",
+            alias: "alias index, which the second ECS service names by tag",
             single: "single manifest, which the function's version 1 runs",
             later: "later single manifest, which the function's $LATEST runs",
         }
@@ -253,21 +256,58 @@ def test_dry_run_in_a_clean_repository(
             assert payload["candidates"] == 0
             assert payload["deleted"] == 0
             assert payload["would_delete"] == 0
-            assert payload["images_in_use_by"]["ecs"] == 1
+            assert payload["images_in_use_by"]["ecs"] == 2
             assert payload["images_in_use_by"]["lambda"] == 2
             view = payload["view"]
             # Lambda may have added a statement for this account's functions to the repository's policy.
             assert view["complete"] is True, view
             assert view["incomplete_because"] == []
             assert view["ecs_clusters"] >= 1
-            assert view["ecs_services"] >= 1
-            # The service's revision: read, under the function's role, as a service shows it before it starts a task.
-            assert view["ecs_service_revisions"] >= 1
+            assert view["ecs_services"] >= 2
+            # Each service's revision: read, under the function's role, as a service shows it before it starts a task.
+            assert view["ecs_service_revisions"] >= 2
             assert view["ecs_task_definitions"] >= 1
             assert view["lambda_image_versions"] >= 2
             assert list_digests(ecr, REPOSITORY) == before
 
-            # 2. The function's code, from the test, names what runs each image.
+            # 2. The function's code, from the test, names what runs each image, and reads the services' deployments.
+            # The function describes each service's current deployment in a DescribeServiceDeployments request of its
+            # own: ECS refuses a request across services, as it does DescribeServiceRevisions. These services show no
+            # current deployment, so the function makes no such request here: the test reads a deployment of each
+            # service with the function's code.
+            ecs = boto3_session.client("ecs", region_name=aws_region)
+            cluster = tf_output["cluster_name"]["value"]
+            services = ecs.describe_services(
+                cluster=cluster,
+                services=[
+                    tf_output["service_name"]["value"],
+                    tf_output["worker_service_name"]["value"],
+                ],
+            )["services"]
+            deployment_arns = {
+                service["serviceArn"]: [
+                    ecs.list_service_deployments(
+                        cluster=cluster, service=service["serviceName"]
+                    )["serviceDeployments"][0]["serviceDeploymentArn"]
+                ]
+                for service in services
+            }
+            deployments = cleanup.describe_by_service(
+                ecs.describe_service_deployments,
+                "serviceDeploymentArns",
+                "serviceDeployments",
+                "serviceDeploymentArn",
+                deployment_arns,
+                "service deployments",
+            )
+            LOG.info(
+                "Both services' deployments, as ECS describes them: %s",
+                json.dumps(deployments, default=str, indent=4),
+            )
+            assert sorted(deployments) == sorted(
+                arn for arns in deployment_arns.values() for arn in arns
+            )
+
             settings = selection.Settings(
                 repository_name=REPOSITORY,
                 registry_id=registry_id,
@@ -287,45 +327,52 @@ def test_dry_run_in_a_clean_repository(
             clients = cleanup.Clients(
                 ecr=ecr,
                 inspector=boto3_session.client("inspector2", region_name=aws_region),
-                ecs=boto3_session.client("ecs", region_name=aws_region),
+                ecs=ecs,
                 lambda_=lambda_client,
             )
-            (service,) = clients.ecs.describe_services(
-                cluster=tf_output["cluster_name"]["value"],
-                services=[tf_output["service_name"]["value"]],
-            )["services"]
-            revisions = [
-                item["arn"] for item in service.get("currentServiceRevisions", [])
-            ]
-            LOG.info(
-                "The service's revisions, as ECS shows them: %s",
-                json.dumps(
-                    (
-                        clients.ecs.describe_service_revisions(
-                            serviceRevisionArns=revisions
-                        )["serviceRevisions"]
-                        if revisions
-                        else []
+            for service in services:
+                revisions = [
+                    item["arn"] for item in service.get("currentServiceRevisions", [])
+                ]
+                LOG.info(
+                    "The revisions of %s, as ECS shows them: %s",
+                    service["serviceName"],
+                    json.dumps(
+                        (
+                            clients.ecs.describe_service_revisions(
+                                serviceRevisionArns=revisions
+                            )["serviceRevisions"]
+                            if revisions
+                            else []
+                        ),
+                        default=str,
+                        indent=4,
                     ),
-                    default=str,
-                    indent=4,
-                ),
-            )
+                )
             plan = cleanup.decide(settings, clients, datetime.now(timezone.utc))
             verdicts = {verdict.unit.root: verdict for verdict in plan.verdicts}
             for root, verdict in verdicts.items():
                 LOG.info(
                     "%s: %s", names.get(root, root), json.dumps(verdict.describe())
                 )
-            assert [use.describe() for use in verdicts[other["index"]].in_use_by] == [
-                {
-                    "source": "ecs",
-                    "via": "deployment",
-                    "cluster": tf_output["cluster_name"]["value"],
-                    "service": tf_output["service_name"]["value"],
-                    "task_definition": tf_output["task_definition"]["value"],
-                }
-            ]
+            ecs_uses = {
+                root: [use.describe() for use in verdicts[root].in_use_by]
+                for root in (other["index"], alias)
+            }
+            assert ecs_uses == {
+                root: [
+                    {
+                        "source": "ecs",
+                        "via": "deployment",
+                        "cluster": cluster,
+                        "service": tf_output[f"{prefix}service_name"]["value"],
+                        "task_definition": tf_output[f"{prefix}task_definition"][
+                            "value"
+                        ],
+                    }
+                ]
+                for root, prefix in ((other["index"], ""), (alias, "worker_"))
+            }
             lambda_uses = {
                 root: [use.describe() for use in verdicts[root].in_use_by]
                 for root in (single, later)
@@ -348,8 +395,7 @@ def test_dry_run_in_a_clean_repository(
                     }
                 ],
             }
-            for root in (pinned["index"], alias):
-                assert verdicts[root].in_use_by == ()
+            assert verdicts[pinned["index"]].in_use_by == ()
 
             # 3. A repository policy that lets another account pull: the view isn't complete.
             LOG.info(
