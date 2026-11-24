@@ -30,7 +30,8 @@ LOG.setLevel(logging.INFO)
 # Throttling and transient errors are retried; once the retries run out, the error fails the run.
 BOTO_CONFIG = Config(retries={"mode": "standard", "max_attempts": 10})
 # BatchGetImage and BatchDeleteImage take at most 100 image ids; ECS's DescribeTasks 100 tasks, DescribeServices 10
-# services, DescribeServiceDeployments and DescribeServiceRevisions 20 ARNs.
+# services, DescribeServiceDeployments and DescribeServiceRevisions 20 ARNs, and DescribeServiceRevisions only those of
+# one service.
 BATCH_SIZE = 100
 TASKS_BATCH_SIZE = 100
 SERVICES_BATCH_SIZE = 10
@@ -357,14 +358,20 @@ def read_ecs(ecs: Any, builder: RuntimeBuilder, services: bool) -> None:
         )
         for _, service in found
     }
-    revisions = _describe_all(
-        ecs.describe_service_revisions,
-        "serviceRevisionArns",
-        "serviceRevisions",
-        "serviceRevisionArn",
-        sorted({arn for arns in revision_arns.values() for arn in arns}),
-        "service revisions",
-    )
+    # ECS refuses a DescribeServiceRevisions request whose revisions belong to more than one service ("Cross service
+    # requests are not allowed"), so each service's are described on their own.
+    revisions: Dict[str, Mapping[str, Any]] = {}
+    for service_arn in sorted(revision_arns):
+        revisions.update(
+            _describe_all(
+                ecs.describe_service_revisions,
+                "serviceRevisionArns",
+                "serviceRevisions",
+                "serviceRevisionArn",
+                sorted(revision_arns[service_arn]),
+                "service revisions",
+            )
+        )
     task_definitions: Dict[str, Mapping[str, Any]] = {}
     for arn in sorted(
         {
@@ -650,7 +657,7 @@ def _describe_all(
     :param arns_param: Its parameter that takes the ARNs.
     :param key: Where its answer's items are.
     :param arn_key: Each item's ARN.
-    :param arns: The ARNs.
+    :param arns: The ARNs; for service revisions, those of one service only.
     :param what: What they are, for the error.
     :return: The items, by ARN.
     :raise CleanupError: if ECS gives a failure, or leaves one out.

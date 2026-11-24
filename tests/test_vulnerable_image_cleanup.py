@@ -35,6 +35,11 @@ OCI_INDEX = "application/vnd.oci.image.index.v1+json"
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
 PULL_ACTIONS = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+# ECS's answer to a DescribeServiceRevisions request whose revisions belong to more than one service, as LoopProof's
+# accounts gave it to 1.1.0.
+CROSS_SERVICE = "Cross service requests are not allowed. All requested service revisions must be for a single service"
+# The most service revisions DescribeServiceRevisions takes in a request.
+MOST_REVISIONS = 20
 
 
 def digest(name: str) -> str:
@@ -118,11 +123,44 @@ def settings(**overrides: Any) -> selection.Settings:
     return selection.Settings(**values)
 
 
+def one_service_per_request(ecs: Any) -> Any:
+    """
+    ECS's DescribeServiceRevisions as the API takes it, around the Stubber's, which checks a request's shape only: it
+    refuses a request whose revisions belong to more than one service, as ECS does, and fails the test on one that
+    asks for more than ECS takes.
+
+    :param ecs: An ECS client.
+    :return: Its DescribeServiceRevisions, with ECS's rules.
+    """
+    describe = ecs.describe_service_revisions
+
+    def describe_service_revisions(**params: Any) -> Dict[str, Any]:
+        arns = params.get("serviceRevisionArns", [])
+        assert len(arns) <= MOST_REVISIONS, arns
+        # A revision's ARN names its service: ...:service-revision/<cluster>/<service>/<id>.
+        if len({arn.rsplit("/", 1)[0] for arn in arns}) > 1:
+            raise ecs.exceptions.InvalidParameterException(
+                {
+                    "Error": {
+                        "Code": "InvalidParameterException",
+                        "Message": CROSS_SERVICE,
+                    }
+                },
+                "DescribeServiceRevisions",
+            )
+        return describe(**params)
+
+    return describe_service_revisions
+
+
 class Stubs:
-    """The run's four clients, each with its Stubber active."""
+    """The run's four clients, each with its Stubber active, and ECS's rules for DescribeServiceRevisions."""
 
     def __init__(self) -> None:
         self.clients = make_clients()
+        self.clients.ecs.describe_service_revisions = one_service_per_request(
+            self.clients.ecs
+        )
         self.ecr = Stubber(self.clients.ecr)
         self.inspector = Stubber(self.clients.inspector)
         self.ecs = Stubber(self.clients.ecs)
@@ -792,7 +830,10 @@ class Repo:
             self.stub_service_revisions(ecs_stub)
 
     def stub_service_revisions(self, ecs_stub: Stubber) -> None:
-        """Answer DescribeServiceDeployments, then DescribeServiceRevisions, 20 ARNs a call, in ARN order."""
+        """
+        Answer DescribeServiceDeployments, every service's current deployment together; then DescribeServiceRevisions,
+        each service's revisions on their own, services in ARN order. 20 ARNs a call, in ARN order.
+        """
         resolving = [
             service
             for services in self.services.values()
@@ -806,34 +847,37 @@ class Repo:
                 if service.get("currentServiceDeployment")
             }
         )
-        revisions = sorted(
-            {
-                arn
-                for service in resolving
-                for arn in selection.service_revision_arns(
+        revisions = {
+            service["serviceArn"]: sorted(
+                selection.service_revision_arns(
                     service,
                     self.service_deployments.get(
                         service.get("currentServiceDeployment")
                     ),
                 )
-            }
-        )
-        for operation, param, key, arns, items in (
+            )
+            for service in resolving
+        }
+        calls = [
             (
                 "describe_service_deployments",
                 "serviceDeploymentArns",
                 "serviceDeployments",
                 deployments,
                 self.service_deployments,
-            ),
+            )
+        ]
+        calls.extend(
             (
                 "describe_service_revisions",
                 "serviceRevisionArns",
                 "serviceRevisions",
-                revisions,
+                revisions[service_arn],
                 self.service_revisions,
-            ),
-        ):
+            )
+            for service_arn in sorted(revisions)
+        )
+        for operation, param, key, arns, items in calls:
             for start in range(0, len(arns), cleanup.REVISIONS_BATCH_SIZE):
                 chunk = arns[start : start + cleanup.REVISIONS_BATCH_SIZE]
                 ecs_stub.add_response(
@@ -3030,21 +3074,66 @@ def test_the_revision_a_deployment_replaces_or_rolls_back_to_keeps_its_digest(ho
     assert summary["view"]["ecs_service_revisions"] == 2
 
 
-def test_revisions_are_read_20_at_a_time():
+def test_each_services_revisions_are_described_on_their_own(caplog):
+    # ECS refuses a DescribeServiceRevisions request whose revisions belong to more than one service. 1.1.0 asked for
+    # every service's at once, and failed every run in LoopProof's accounts, which run several services. Each
+    # service's tag has moved on: only the digest its revision resolved keeps its image.
+    repo = Repo()
+    made = {}
+    for name in ("api", "ingest"):
+        made[name] = pulled_long_ago(repo, name, tags=[name])
+        task_definition = repo.task_definition(f"{name}:1", uri("moved-on"))
+        revision = repo.revision(
+            name, 1, task_definition, [(uri("moved-on"), made[name]["index"])]
+        )
+        repo.service(
+            name,
+            [("PRIMARY", task_definition)],
+            revisions=[revision],
+            current_deployment=repo.deployment(name, revision),
+        )
+    with caplog.at_level("INFO"):
+        summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["view"]["ecs_services"] == 2
+    assert summary["view"]["ecs_service_revisions"] == 2
+    lines = {line["digests"][0]: line for line in image_lines(caplog)}
+    for name in ("api", "ingest"):
+        assert lines[made[name]["index"]]["in_use_by"] == [
+            {
+                "source": "ecs",
+                "via": "deployment",
+                "cluster": "prod",
+                "service": name,
+                "task_definition": f"{name}:1",
+            }
+        ]
+
+
+def test_a_services_revisions_are_read_20_at_a_time():
+    # One service's 21 revisions take two requests, both of that service only; the other service's, a third.
     repo = Repo()
     made = pulled_long_ago(repo, "old")
-    for number in range(21):
-        web = repo.task_definition(f"web-{number:02}:1", uri("other"))
-        revision = repo.revision(
-            f"web-{number:02}",
-            1,
+    web = repo.task_definition("web:1", uri("other"))
+    revisions = [
+        repo.revision(
+            "web",
+            number,
             web,
             [(uri("other"), made["index"] if number == 20 else digest(f"x{number}"))],
         )
-        repo.service(f"web-{number:02}", [("PRIMARY", web)], revisions=[revision])
+        for number in range(21)
+    ]
+    repo.service("web", [("PRIMARY", web)], revisions=revisions)
+    worker = repo.task_definition("worker:1", uri("other"))
+    repo.service(
+        "worker",
+        [("PRIMARY", worker)],
+        revisions=[repo.revision("worker", 1, worker, [(uri("other"), None)])],
+    )
     summary = repo.run()
     assert summary["protected"]["in_use"] == 1
-    assert summary["view"]["ecs_service_revisions"] == 21
+    assert summary["view"]["ecs_service_revisions"] == 22
 
 
 @pytest.mark.parametrize(
