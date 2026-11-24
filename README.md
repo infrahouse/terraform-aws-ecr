@@ -12,6 +12,37 @@ Creates an AWS ECR repository with configurable lifecycle policies
 for automatic image expiration, including support for rollback
 candidate retention.
 
+## Why This Module?
+
+A repository takes a few lines of Terraform. A lifecycle policy that
+never expires an image something still runs takes more care: ECR
+applies the rules by priority, a rule can't expire an image that a
+higher-priority rule selects but still counts it, and some
+combinations of rules ECR refuses only at apply. The module writes the
+policy from a few inputs, in an order that protects what runs:
+
+- **Rollback candidates.** The images your deployments tagged
+  `deployed-at-*` get rules of their own, ahead of the tagged-image
+  rules, so the last N deployments stay however old they are and
+  however many images CI pushes after them.
+- **Retained tags.** Each tag in `retain_tags` gets a rule at the first
+  priorities that keeps the one image carrying it. The image a
+  scheduled task pins can't be expired by any other rule, even once it
+  was deployed and carries a `deployed-at-*` tag.
+- **The rule order, computed.** Retained tags first, then rollback
+  candidates, then tagged images, then untagged ones. Add a retained
+  tag, and the other rules move down without renumbering.
+- **Vulnerable image cleanup.** Amazon Inspector reports
+  vulnerabilities in every image it monitors, used or not. An opt-in
+  daily Lambda deletes the vulnerable images that nothing protects. It
+  keeps what the lifecycle policy keeps, what runs or ran recently,
+  what was pushed recently, and anything whose use it can't judge. It
+  runs dry until you turn deletion on, and fails closed.
+
+The module creates the repository and its lifecycle policy, and the
+cleanup when it is on. It sets no repository policy, replication,
+scanning or encryption options.
+
 ## Features
 
 - ECR repository with configurable lifecycle policies
@@ -60,8 +91,8 @@ module "foo_ecr" {
 
 The module supports up to six lifecycle rules, each activated by
 setting the corresponding variable, plus one rule per retained tag.
-All are optional and default to `null` (disabled), or `[]` for
-`retain_tags`.
+Each defaults to `null` (disabled), or `[]` for `retain_tags`, but at
+least one must be set: with no rule, `terraform plan` fails.
 
 ### Regular image expiry
 
@@ -74,7 +105,14 @@ All are optional and default to `null` (disabled), or `[]` for
 
 When using `expire_count_tagged` or `expire_days_tagged`, you must
 also set `tag_prefix_list` or `tag_pattern_list` to specify which
-tagged images the rule applies to.
+tagged images the rule applies to. With more than one value in the
+list, ECR selects only the images that have a matching tag for every
+value.
+
+Set one input of each pair: `expire_count_tagged` or
+`expire_days_tagged`, `expire_count_untagged` or
+`expire_days_untagged`, `tag_prefix_list` or `tag_pattern_list`. ECR
+refuses a policy with both, at `terraform apply`.
 
 ### Rollback candidate retention
 
@@ -89,6 +127,11 @@ separate, typically more generous, retention rules to these images.
 | `rollback_candidate_tag_prefix` | Tag prefix for rollback candidates (default: `deployed-at-`) |
 | `rollback_candidate_retain_count` | Keep at most N rollback candidates |
 | `rollback_candidate_retain_days` | Keep rollback candidates for N days |
+
+Set one of the two: they are rules on the same tag prefix, and ECR
+refuses a policy with both, at `terraform apply`. Prefer the count:
+the days rule goes by push time, so a service that hasn't deployed for
+N days loses every rollback candidate, the image that runs among them.
 
 ### Retained tags
 
@@ -164,41 +207,51 @@ module "my_service_ecr" {
 With this configuration, your ECR repo might look like:
 
 ```
-IMAGE    TAGS                               AGE   KEPT BY RULE
-img-A    v-abc1234, deployed-at-...T17-00Z  1d    rollback_candidate (1 of 5)
-img-F    v-pqr1234                          2d    expire_count_tagged (1 of 3)
-img-B    v-def5678, deployed-at-...T09-00Z  4d    rollback_candidate (2 of 5)
-img-G    v-stu5678                          6d    expire_count_tagged (2 of 3)
-img-H    v-vwx9012                          9d    expire_count_tagged (3 of 3)
-img-I    v-yza3456                          12d   EXPIRED
-img-C    v-ghi9012, deployed-at-...T12-00Z  13d   rollback_candidate (3 of 5)
-img-D    v-jkl3456, deployed-at-...T08-00Z  27d   rollback_candidate (4 of 5)
-img-E    v-mno7890, deployed-at-...T14-00Z  53d   rollback_candidate (5 of 5)
-         <untagged manifests>               <7d   expire_days_untagged
+IMAGE    TAGS                               AGE   RESULT
+img-A    v-abc1234, deployed-at-...T17-00Z  1d    kept: rollback candidate (1 of 5)
+img-F    v-pqr1234                          2d    kept: expire_count_tagged (2 of 3)
+img-B    v-def5678, deployed-at-...T09-00Z  4d    kept: rollback candidate (2 of 5)
+img-G    v-stu5678                          6d    EXPIRED by expire_count_tagged
+img-H    v-vwx9012                          9d    EXPIRED by expire_count_tagged
+img-I    v-yza3456                          12d   EXPIRED by expire_count_tagged
+img-C    v-ghi9012, deployed-at-...T12-00Z  13d   kept: rollback candidate (3 of 5)
+img-D    v-jkl3456, deployed-at-...T08-00Z  27d   kept: rollback candidate (4 of 5)
+img-E    v-mno7890, deployed-at-...T14-00Z  53d   kept: rollback candidate (5 of 5)
+         <untagged manifests>               <7d   kept until expire_days_untagged
 ```
 
-Note that deployed images carry **both** their original CI tag
-(`v-*`) and the rollback candidate tag (`deployed-at-*`). Each
-image is matched by exactly **one** lifecycle rule — the
-highest-priority rule whose tag filter matches. Rollback candidate
-rules have higher priority than general tagged rules, so a
-deployed image is protected by the rollback rule even if the
-general tagged rule would expire it.
+ECR's lifecycle policy preview gives the same result for these images.
 
-The key insight: rollback candidates are retained independently
-from regular CI images. Even if a service hasn't been deployed in
-months, its last 5 successful deployment images are preserved —
-preventing the kind of outage where an old but still-active image
-gets pruned.
+Note that deployed images carry **both** their original CI tag
+(`v-*`) and the rollback candidate tag (`deployed-at-*`). An image is
+expired by one rule at most, and a rule can't expire an image whose
+tags match a higher-priority rule's filter. Rollback candidate rules
+have higher priority than general tagged rules, so a deployed image is
+protected by the rollback rule even if the general tagged rule would
+expire it.
+
+A rule still counts the images that higher-priority rules select. The
+tagged rule's prefix, `v`, matches the deployed images too, so `img-A`
+and `img-B` take two of its three places: only one image without a
+`deployed-at-*` tag, `img-F`, stays. Size `expire_count_tagged` for the
+CI images you want plus the rollback candidates among the newest.
+
+The key insight: rollback candidates are retained by rules of their
+own. Even if a service hasn't been deployed in months, its last 5
+successful deployment images are preserved — preventing the kind of
+outage where an old but still-active image gets pruned.
 
 ### Security note: mutable image tags
 
-This module does **not** enable ECR immutable tags because the
-rollback candidate feature requires adding tags to existing images
-after deployment (via `PutImage`). This means a principal with
-`ecr:PutImage` permission could retag a malicious image to look
-like a known-good deployment. Mitigate this by restricting
-`ecr:PutImage` to the deployment Lambda role only.
+This module does **not** set ECR tag immutability, so tags are
+mutable, ECR's default. A principal with `ecr:PutImage` permission can
+move a tag to another image, or add a `deployed-at-*` tag to any
+image, and so make a malicious image look like a known-good
+deployment or a rollback candidate. Immutable tags would stop the
+first, not the second: ECR still accepts a new tag on an existing
+image, which is also how rollback candidates get their tag. Mitigate
+this by restricting `ecr:PutImage` to CI and the deployment Lambda
+role.
 
 ## Vulnerable image cleanup
 
@@ -215,7 +268,7 @@ It is off by default, and creates nothing until
 ```hcl
 module "my_service_ecr" {
     source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-    version = "..." # the first release with the cleanup, or later
+    version = "1.0.1"
 
     repo_name    = "my-service-repo"
     environment  = "production"
@@ -375,16 +428,17 @@ production pin, in `retain_tags`.
 
 ## Documentation
 
-- [GitHub Pages](https://infrahouse.github.io/terraform-aws-ecr/)
-- [Examples](examples/)
+The full documentation is on [GitHub Pages](https://infrahouse.github.io/terraform-aws-ecr/):
 
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## License
-
-[Apache 2.0](LICENSE)
+- [Getting Started](https://infrahouse.github.io/terraform-aws-ecr/getting-started/): prerequisites and a first
+  deployment
+- [Architecture](https://infrahouse.github.io/terraform-aws-ecr/architecture/): the repository, how ECR applies the
+  lifecycle rules, and the cleanup, with diagrams
+- [Configuration](https://infrahouse.github.io/terraform-aws-ecr/configuration/): every input, and when to change it
+- [Examples](https://infrahouse.github.io/terraform-aws-ecr/examples/): common uses
+- [Troubleshooting](https://infrahouse.github.io/terraform-aws-ecr/troubleshooting/): errors at plan and apply, and
+  what the cleanup's logs say
+- [Changelog](https://infrahouse.github.io/terraform-aws-ecr/changelog/)
 
 <!-- BEGIN_TF_DOCS -->
 
@@ -459,3 +513,23 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | <a name="output_vulnerable_image_cleanup_function_arn"></a> [vulnerable\_image\_cleanup\_function\_arn](#output\_vulnerable\_image\_cleanup\_function\_arn) | ARN of the vulnerable image cleanup's Lambda function; null when the cleanup is off. |
 | <a name="output_vulnerable_image_cleanup_function_name"></a> [vulnerable\_image\_cleanup\_function\_name](#output\_vulnerable\_image\_cleanup\_function\_name) | Name of the vulnerable image cleanup's Lambda function; null when the cleanup is off. |
 <!-- END_TF_DOCS -->
+
+## Examples
+
+- [examples/basic](examples/basic): a repository whose tagged releases expire after a year, and that keeps the 5
+  newest untagged images
+- [examples/rollback-and-retained-tags](examples/rollback-and-retained-tags): rollback candidates kept for an ECS
+  service, and an image a task pins kept by its tag
+- [examples/vulnerable-image-cleanup](examples/vulnerable-image-cleanup): the vulnerable image cleanup turned on, in
+  dry run, with how to turn deletion on
+
+Each is a complete root module, and the test suite runs `terraform init` and `terraform validate` on each against this
+checkout. The [Examples](https://infrahouse.github.io/terraform-aws-ecr/examples/) page explains them.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[Apache 2.0](LICENSE)
