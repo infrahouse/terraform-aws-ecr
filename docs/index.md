@@ -73,7 +73,7 @@ with a role of this account looks like this account to the policies: put the tag
 ```hcl
 module "ecr" {
   source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-  version = "1.0.2"
+  version = "1.1.0"
 
   repo_name    = "my-service"
   environment  = "production"

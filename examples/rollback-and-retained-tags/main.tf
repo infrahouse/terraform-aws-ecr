@@ -14,7 +14,7 @@ provider "aws" {
 
 module "ecr" {
   source  = "registry.infrahouse.com/infrahouse/ecr/aws"
-  version = "1.0.2"
+  version = "1.1.0"
 
   repo_name    = var.repo_name
   environment  = var.environment
