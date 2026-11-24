@@ -85,6 +85,7 @@ VIEW_COUNTS = (
     "ecs_clusters",
     "ecs_running_tasks",
     "ecs_services",
+    "ecs_service_revisions",
     "ecs_task_definitions",
     "lambda_image_versions",
 )
@@ -95,6 +96,10 @@ VIA_FUNCTION_VERSION = "function_version"
 # A service's deployments, and task sets, whose task definitions it runs or may go back to: the one it deploys, and
 # those it is replacing. INACTIVE ones are done with; DRAINING task sets' tasks are stopping, and running ones are read.
 DEPLOYED_STATUSES = frozenset({"PRIMARY", "ACTIVE"})
+# The deployment controllers that resolve a container's tag to a digest when a deployment starts its first task, and
+# start every later task of it from that digest (version consistency). CODE_DEPLOY and EXTERNAL don't. A service
+# without a controller set uses ECS's.
+TAG_RESOLVING_CONTROLLERS = frozenset({None, "ECS"})
 # What a pull needs: the manifest, and the layers.
 PULL_ACTIONS = ("ecr:batchgetimage", "ecr:getdownloadurlforlayer")
 # Condition keys that grant an organization, or a part of one, rather than an account.
@@ -150,6 +155,7 @@ class Settings:
     :param repository_name: The ECR repository.
     :param registry_id: Its registry, the account id.
     :param region: Its Region: the job reads ECR, Inspector, ECS and Lambda there.
+    :param repository_arn: Its ARN, which the registry's policy names it by.
     :param dry_run: Log what would be deleted, and delete nothing.
     :param min_severity: The least Inspector severity that makes an image vulnerable.
     :param min_age: An image pushed within this is protected.
@@ -165,6 +171,7 @@ class Settings:
     repository_name: str
     registry_id: str
     region: str
+    repository_arn: str
     dry_run: bool
     min_severity: str
     min_age: timedelta
@@ -185,6 +192,14 @@ class Settings:
             )
         if not re.fullmatch(r"[a-z]{2}(-[a-z]+)+-\d+", self.region):
             raise SettingsError(f"The Region isn't one. Got: {self.region!r}")
+        if not re.fullmatch(
+            rf"arn:[a-z-]+:ecr:{re.escape(self.region)}:{self.registry_id}:"
+            rf"repository/{re.escape(self.repository_name)}",
+            self.repository_arn,
+        ):
+            raise SettingsError(
+                f"The repository's ARN isn't this repository's. Got: {self.repository_arn!r}"
+            )
         if self.min_severity not in SEVERITIES:
             raise SettingsError(
                 f"The least severity must be one of {SEVERITIES}. Got: {self.min_severity!r}"
@@ -220,6 +235,7 @@ class Settings:
                 repository_name=environ["REPOSITORY_NAME"],
                 registry_id=environ["REGISTRY_ID"],
                 region=environ["REPOSITORY_REGION"],
+                repository_arn=environ["REPOSITORY_ARN"],
                 dry_run=_boolean(environ, "DRY_RUN"),
                 min_severity=environ["MIN_SEVERITY"],
                 min_age=timedelta(days=float(environ["MIN_AGE_DAYS"])),
@@ -713,29 +729,6 @@ class RuntimeBuilder:
         """Count a cluster read."""
         self._count("ecs_clusters")
 
-    def add_deployment(
-        self,
-        cluster_arn: str,
-        service: Mapping[str, Any],
-        task_definition: Mapping[str, Any],
-    ) -> None:
-        """
-        :param cluster_arn: The service's cluster.
-        :param service: One ``services`` item of DescribeServices.
-        :param task_definition: The ``taskDefinition`` of DescribeTaskDefinition, for a task definition the service
-            deploys (:func:`deployed_task_definitions`).
-        """
-        use = Use(
-            source=JUDGED_BY_ECS,
-            via=VIA_DEPLOYMENT,
-            cluster=_last_part(cluster_arn),
-            service=service.get("serviceName") or _last_part(service["serviceArn"]),
-            task_definition=_last_part(task_definition["taskDefinitionArn"]),
-        )
-        for container in task_definition.get("containerDefinitions") or ():
-            if container.get("image"):
-                self._add_reference(container["image"], use)
-
     def add_function_version(
         self, configuration: Mapping[str, Any], code: Mapping[str, Any]
     ) -> None:
@@ -758,6 +751,16 @@ class RuntimeBuilder:
         elif code.get("ImageUri"):
             self._add_reference(code["ImageUri"], use)
 
+    def add_registry_policy(self, text: Optional[str]) -> None:
+        """
+        :param text: The registry's policy, as GetRegistryPolicy gives it; None if it has none.
+        """
+        self._incomplete.extend(
+            registry_policy_gaps(
+                text, self._settings.registry_id, self._settings.repository_arn
+            )
+        )
+
     def add_repository_policy(self, text: Optional[str]) -> None:
         """
         :param text: The repository's policy, as GetRepositoryPolicy gives it; None if it has none.
@@ -766,9 +769,72 @@ class RuntimeBuilder:
             repository_policy_gaps(text, self._settings.registry_id)
         )
 
-    def add_service(self) -> None:
-        """Count a service read."""
+    def add_service(
+        self,
+        cluster_arn: str,
+        service: Mapping[str, Any],
+        task_definitions: Sequence[Mapping[str, Any]],
+        revisions: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """
+        What a service runs, or starts when it scales up or rolls back.
+
+        Its deployments' task definitions name images by tag or digest. Under ECS's deployment controller, a
+        deployment resolves each tag to a digest when it starts its first task, and starts every later task of it from
+        that digest, though the tag has moved since: its service revision records the digest. So both count: the
+        revisions' digests, and the task definitions' tags and digests, for a deployment that has started no task
+        yet, a container with version consistency off, or another controller. A service under ECS's controller that
+        shows no revision, whose task definitions name this repository by tag with version consistency on, may run a
+        digest the job can't see: the view isn't complete.
+
+        :param cluster_arn: The service's cluster.
+        :param service: One ``services`` item of DescribeServices.
+        :param task_definitions: The ``taskDefinition`` of DescribeTaskDefinition for each task definition it deploys
+            (:func:`deployed_task_definitions`).
+        :param revisions: The ``serviceRevisions`` of DescribeServiceRevisions for each revision it runs or may go
+            back to (:func:`service_revision_arns`).
+        """
         self._count("ecs_services")
+        cluster = _last_part(cluster_arn)
+        name = service.get("serviceName") or _last_part(service["serviceArn"])
+        for task_definition in task_definitions:
+            use = Use(
+                source=JUDGED_BY_ECS,
+                via=VIA_DEPLOYMENT,
+                cluster=cluster,
+                service=name,
+                task_definition=_last_part(task_definition["taskDefinitionArn"]),
+            )
+            for container in task_definition.get("containerDefinitions") or ():
+                if container.get("image"):
+                    self._add_reference(container["image"], use)
+                if revisions or not resolves_tags(service):
+                    continue
+                reference = ImageReference.parse(container.get("image") or "")
+                if (
+                    container.get("versionConsistency") != "disabled"
+                    and reference.digest is None
+                    and self._settings.names_this_repository(reference)
+                ):
+                    self._incomplete.append(
+                        f"ECS service {cluster}/{name} shows no service revision, so not the digest its tag "
+                        f"{reference.tag} resolved to"
+                    )
+        for revision in revisions:
+            self._count("ecs_service_revisions")
+            use = Use(
+                source=JUDGED_BY_ECS,
+                via=VIA_DEPLOYMENT,
+                cluster=cluster,
+                service=name,
+                task_definition=_last_part(revision.get("taskDefinition") or "")
+                or None,
+            )
+            for image in revision.get("containerImages") or ():
+                if image.get("imageDigest"):
+                    self._add_digest(image["imageDigest"], use)
+                if image.get("image"):
+                    self._add_reference(image["image"], use)
 
     def add_task(self, cluster_arn: str, task: Mapping[str, Any]) -> None:
         """
@@ -844,6 +910,52 @@ def deployed_task_definitions(service: Mapping[str, Any]) -> List[str]:
     return list(dict.fromkeys(arn for arn in arns if arn))
 
 
+def resolves_tags(service: Mapping[str, Any]) -> bool:
+    """
+    :param service: One ``services`` item of DescribeServices.
+    :return: True if its deployment controller resolves tags to digests when a deployment starts: ECS's.
+    """
+    return (service.get("deploymentController") or {}).get(
+        "type"
+    ) in TAG_RESOLVING_CONTROLLERS
+
+
+def service_revision_arns(
+    service: Mapping[str, Any], deployment: Optional[Mapping[str, Any]]
+) -> List[str]:
+    """
+    :param service: One ``services`` item of DescribeServices.
+    :param deployment: Its current service deployment, as DescribeServiceDeployments gives it, if it has one.
+    :return: The service revisions it runs or may go back to: its current ones, and its current deployment's target,
+        the revisions that deployment replaces, and the one it rolls back to.
+    """
+    arns = [item.get("arn") for item in service.get("currentServiceRevisions") or ()]
+    if deployment:
+        arns.append((deployment.get("targetServiceRevision") or {}).get("arn"))
+        arns.extend(
+            item.get("arn") for item in deployment.get("sourceServiceRevisions") or ()
+        )
+        arns.append((deployment.get("rollback") or {}).get("serviceRevisionArn"))
+    return list(dict.fromkeys(arn for arn in arns if arn))
+
+
+def registry_policy_gaps(
+    text: Optional[str], registry_id: str, repository_arn: str
+) -> List[str]:
+    """
+    Who outside the account the registry's policy lets pull from this repository, as far as the job can't prove
+    otherwise: :func:`repository_policy_gaps`'s rules, over the statements whose ``Resource`` may name this
+    repository (a wildcard included), whose ``NotResource`` doesn't, or that name neither.
+
+    :param text: The policy, as GetRegistryPolicy gives it; None if the registry has none.
+    :param registry_id: This account.
+    :param repository_arn: This repository's ARN.
+    :return: Why the view is incomplete; empty if no one outside the account may pull.
+    :raise RepositoryError: if the policy isn't a JSON object.
+    """
+    return _policy_gaps(text, registry_id, "registry policy", repository_arn)
+
+
 def repository_policy_gaps(text: Optional[str], registry_id: str) -> List[str]:
     """
     Who outside the account the repository's policy lets pull, as far as the job can't prove otherwise.
@@ -858,25 +970,44 @@ def repository_policy_gaps(text: Optional[str], registry_id: str) -> List[str]:
     :return: Why the view is incomplete; empty if no one outside the account may pull.
     :raise RepositoryError: if the policy isn't a JSON object.
     """
+    return _policy_gaps(text, registry_id, "repository policy", None)
+
+
+def _policy_gaps(
+    text: Optional[str],
+    registry_id: str,
+    source: str,
+    repository_arn: Optional[str],
+) -> List[str]:
+    """
+    :param text: The policy; None for none.
+    :param registry_id: This account.
+    :param source: Which policy it is, as its gaps say.
+    :param repository_arn: For a registry's policy, this repository's ARN, which a statement must cover to count. None
+        for the repository's own, whose every statement covers it.
+    :return: Why the view is incomplete.
+    :raise RepositoryError: if the policy isn't a JSON object.
+    """
     if text is None:
         return []
     try:
         document = json.loads(text)
     except ValueError as err:
-        raise RepositoryError(f"The repository's policy isn't JSON: {err}") from err
+        raise RepositoryError(f"The {source} isn't JSON: {err}") from err
     if not isinstance(document, dict):
-        raise RepositoryError("The repository's policy isn't a JSON object.")
+        raise RepositoryError(f"The {source} isn't a JSON object.")
     statements = document.get("Statement") or []
     if isinstance(statements, dict):
         statements = [statements]
     if not isinstance(statements, list):
-        return ["repository policy has a Statement the job can't read"]
+        return [f"{source} has a Statement the job can't read"]
     gaps: List[str] = []
     for statement in statements:
         try:
-            gaps.extend(_statement_gaps(statement, registry_id))
+            if repository_arn is None or _covers(statement, repository_arn):
+                gaps.extend(_statement_gaps(statement, registry_id, source))
         except _UnreadablePolicy as err:
-            gaps.append(f"repository policy has a statement the job can't read: {err}")
+            gaps.append(f"{source} has a statement the job can't read: {err}")
     return list(dict.fromkeys(gaps))
 
 
@@ -1345,10 +1476,35 @@ class _UnreadablePolicy(ValueError):
     """A repository policy statement in a shape the job can't read."""
 
 
-def _statement_gaps(statement: Any, registry_id: str) -> List[str]:
+def _covers(statement: Any, repository_arn: str) -> bool:
     """
-    :param statement: One statement of a repository policy.
+    :param statement: One statement of a registry's policy.
+    :param repository_arn: This repository's ARN.
+    :return: True if it may cover the repository: a ``Resource`` that matches its ARN, a ``NotResource`` that doesn't,
+        or neither. Matched as IAM matches, wildcards included, and case-insensitively, so a statement counts rather
+        than not.
+    :raise _UnreadablePolicy: if it isn't shaped as IAM documents it.
+    """
+    if not isinstance(statement, dict):
+        raise _UnreadablePolicy("not an object")
+    if "NotResource" in statement:
+        return not any(
+            _wildcard_matches(pattern, repository_arn.lower())
+            for pattern in _strings(statement["NotResource"], "NotResource")
+        )
+    if "Resource" in statement:
+        return any(
+            _wildcard_matches(pattern, repository_arn.lower())
+            for pattern in _strings(statement["Resource"], "Resource")
+        )
+    return True
+
+
+def _statement_gaps(statement: Any, registry_id: str, source: str) -> List[str]:
+    """
+    :param statement: One statement of a repository's or a registry's policy.
     :param registry_id: This account.
+    :param source: Which policy it is, as its gaps say.
     :return: Who outside the account it lets pull.
     :raise _UnreadablePolicy: if it isn't shaped as IAM documents it.
     """
@@ -1361,21 +1517,21 @@ def _statement_gaps(statement: Any, registry_id: str) -> List[str]:
     if not isinstance(condition, dict):
         raise _UnreadablePolicy(f"{name}'s Condition isn't an object")
     gaps = [
-        f"repository policy allows an organization ({key} in {name})"
+        f"{source} allows an organization ({key} in {name})"
         for operator in condition.values()
         if isinstance(operator, dict)
         for key in operator
         if key.lower() in ORGANIZATION_KEYS
     ]
     if "NotPrincipal" in statement:
-        gaps.append(f"repository policy allows everyone but a NotPrincipal ({name})")
+        gaps.append(f"{source} allows everyone but a NotPrincipal ({name})")
     principal = statement.get("Principal")
     if principal is None:
         if "NotPrincipal" not in statement:
-            gaps.append(f"repository policy names no principal ({name})")
+            gaps.append(f"{source} names no principal ({name})")
         return gaps
     if principal == "*":
-        return gaps + ["repository policy allows *"]
+        return gaps + [f"{source} allows *"]
     if not isinstance(principal, dict):
         raise _UnreadablePolicy(f"{name}'s Principal isn't an object")
     for kind, values in principal.items():
@@ -1383,23 +1539,23 @@ def _statement_gaps(statement: Any, registry_id: str) -> List[str]:
             if kind == "AWS":
                 account = _principal_account(value)
                 if value == "*":
-                    gaps.append("repository policy allows *")
+                    gaps.append(f"{source} allows *")
                 elif account is None:
                     gaps.append(
-                        f"repository policy allows a principal the job can't place in an account: {value}"
+                        f"{source} allows a principal the job can't place in an account: {value}"
                     )
                 elif account != registry_id:
-                    gaps.append(f"repository policy allows account {account}")
+                    gaps.append(f"{source} allows account {account}")
             elif kind == "Service" and value.lower() == "lambda.amazonaws.com":
                 if not _for_this_accounts_functions(condition, registry_id):
                     gaps.append(
-                        "repository policy allows lambda.amazonaws.com for functions it doesn't prove are this "
+                        f"{source} allows lambda.amazonaws.com for functions it doesn't prove are this "
                         f"account's ({name})"
                     )
             elif kind == "Service":
-                gaps.append(f"repository policy allows service {value}")
+                gaps.append(f"{source} allows service {value}")
             else:
-                gaps.append(f"repository policy allows {kind} principal {value}")
+                gaps.append(f"{source} allows {kind} principal {value}")
     return gaps
 
 
@@ -1411,28 +1567,29 @@ def _allows_pull(statement: Mapping[str, Any]) -> bool:
     if "NotAction" in statement:
         excluded = _strings(statement["NotAction"], "NotAction")
         return any(
-            not any(_action_matches(pattern, action) for pattern in excluded)
+            not any(_wildcard_matches(pattern, action) for pattern in excluded)
             for action in PULL_ACTIONS
         )
     actions = _strings(statement.get("Action", []), "Action")
     return any(
-        _action_matches(pattern, action)
+        _wildcard_matches(pattern, action)
         for pattern in actions
         for action in PULL_ACTIONS
     )
 
 
-def _action_matches(pattern: str, action: str) -> bool:
+def _wildcard_matches(pattern: str, value: str) -> bool:
     """
-    :param pattern: An action in a policy, maybe with ``*`` and ``?``.
-    :param action: An action, in lowercase.
-    :return: True if IAM matches it: case-insensitively, wildcards included.
+    :param pattern: An action or a resource in a policy, maybe with ``*`` and ``?``.
+    :param value: An action or an ARN, in lowercase.
+    :return: True if the pattern matches it, wildcards included, case-insensitively: as IAM matches an action, and
+        more broadly than it matches an ARN.
     """
     expression = "".join(
         ".*" if char == "*" else "." if char == "?" else re.escape(char)
         for char in pattern.lower()
     )
-    return re.fullmatch(expression, action) is not None
+    return re.fullmatch(expression, value) is not None
 
 
 def _for_this_accounts_functions(

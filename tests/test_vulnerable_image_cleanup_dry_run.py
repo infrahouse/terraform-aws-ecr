@@ -5,8 +5,9 @@ image whose platform image or single manifest ECR never recorded a pull of as ne
 record one there.
 
 It reads what ECS and Lambda run, under its own role: an ECS service scaled to zero whose task definition names an
-image by tag, and a container image function whose version 1 runs one pushed image and whose $LATEST runs another.
-Then a repository policy that lets another account pull makes its view incomplete.
+image by tag, with its service revision, and a container image function whose version 1 runs one pushed image and
+whose $LATEST runs another. Then a repository policy that lets another account pull makes its view incomplete. The
+test account has no registry policy, which is account-wide, so the test sets none: the unit tests judge one.
 """
 
 import base64
@@ -42,6 +43,7 @@ READS = {
     "ecr:DescribeImages",
     "ecr:BatchGetImage",
     "ecr:GetRepositoryPolicy",
+    "ecr:GetRegistryPolicy",
     "inspector2:ListFindings",
     "inspector2:ListCoverage",
     "ecs:ListClusters",
@@ -49,6 +51,8 @@ READS = {
     "ecs:DescribeTasks",
     "ecs:ListServices",
     "ecs:DescribeServices",
+    "ecs:DescribeServiceDeployments",
+    "ecs:DescribeServiceRevisions",
     "ecs:DescribeTaskDefinition",
     "lambda:ListFunctions",
     "lambda:GetFunction",
@@ -257,6 +261,8 @@ def test_dry_run_in_a_clean_repository(
             assert view["incomplete_because"] == []
             assert view["ecs_clusters"] >= 1
             assert view["ecs_services"] >= 1
+            # The service's revision: read, under the function's role, as a service shows it before it starts a task.
+            assert view["ecs_service_revisions"] >= 1
             assert view["ecs_task_definitions"] >= 1
             assert view["lambda_image_versions"] >= 2
             assert list_digests(ecr, REPOSITORY) == before
@@ -266,6 +272,7 @@ def test_dry_run_in_a_clean_repository(
                 repository_name=REPOSITORY,
                 registry_id=registry_id,
                 region=aws_region,
+                repository_arn=tf_output["repository_arn"]["value"],
                 dry_run=True,
                 min_severity="HIGH",
                 min_age=timedelta(days=7),
@@ -282,6 +289,27 @@ def test_dry_run_in_a_clean_repository(
                 inspector=boto3_session.client("inspector2", region_name=aws_region),
                 ecs=boto3_session.client("ecs", region_name=aws_region),
                 lambda_=lambda_client,
+            )
+            (service,) = clients.ecs.describe_services(
+                cluster=tf_output["cluster_name"]["value"],
+                services=[tf_output["service_name"]["value"]],
+            )["services"]
+            revisions = [
+                item["arn"] for item in service.get("currentServiceRevisions", [])
+            ]
+            LOG.info(
+                "The service's revisions, as ECS shows them: %s",
+                json.dumps(
+                    (
+                        clients.ecs.describe_service_revisions(
+                            serviceRevisionArns=revisions
+                        )["serviceRevisions"]
+                        if revisions
+                        else []
+                    ),
+                    default=str,
+                    indent=4,
+                ),
             )
             plan = cleanup.decide(settings, clients, datetime.now(timezone.utc))
             verdicts = {verdict.unit.root: verdict for verdict in plan.verdicts}

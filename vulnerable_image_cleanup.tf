@@ -50,6 +50,12 @@ data "aws_iam_policy_document" "vulnerable_image_cleanup" {
     actions   = ["inspector2:ListFindings", "inspector2:ListCoverage"]
     resources = ["*"]
   }
+  # The registry's policy may let another account pull from this repository too. It takes no resource ARN.
+  statement {
+    sid       = "ReadRegistryPolicy"
+    actions   = ["ecr:GetRegistryPolicy"]
+    resources = ["*"]
+  }
 
   # What ECS and Lambda run, in the repository's account and Region: every cluster's running tasks, every service's
   # deployed task definitions, every version of every container image function. Read-only.
@@ -80,6 +86,24 @@ data "aws_iam_policy_document" "vulnerable_image_cleanup" {
     sid       = "DescribeEcsServices"
     actions   = ["ecs:DescribeServices"]
     resources = ["${local.ecs_arn_prefix}:service/*"]
+  }
+  # The digests a service's deployments resolved its tags to: its current deployment, and its revisions. Each action
+  # names two resource types: the service, and its deployment or its revision.
+  statement {
+    sid     = "DescribeEcsServiceDeployments"
+    actions = ["ecs:DescribeServiceDeployments"]
+    resources = [
+      "${local.ecs_arn_prefix}:service/*",
+      "${local.ecs_arn_prefix}:service-deployment/*",
+    ]
+  }
+  statement {
+    sid     = "DescribeEcsServiceRevisions"
+    actions = ["ecs:DescribeServiceRevisions"]
+    resources = [
+      "${local.ecs_arn_prefix}:service/*",
+      "${local.ecs_arn_prefix}:service-revision/*",
+    ]
   }
   # ListFunctions takes no resource ARN.
   statement {
@@ -122,6 +146,7 @@ module "vulnerable_image_cleanup" {
     REPOSITORY_NAME                 = aws_ecr_repository.repo.name
     REGISTRY_ID                     = aws_ecr_repository.repo.registry_id
     REPOSITORY_REGION               = local.repository_region
+    REPOSITORY_ARN                  = aws_ecr_repository.repo.arn
     DRY_RUN                         = tostring(var.vulnerable_image_cleanup_dry_run)
     MIN_SEVERITY                    = var.vulnerable_image_cleanup_min_severity
     MIN_AGE_DAYS                    = tostring(var.vulnerable_image_cleanup_min_age_days)
