@@ -1,16 +1,19 @@
 """
 Unit tests of the vulnerable image cleanup: no AWS.
 
-Each test describes a repository and what Inspector says about it, then runs the Lambda's code against boto3 clients
-whose answers botocore's Stubber serves. The Stubber checks every answer against botocore's model, so they are shaped
-as botocore gives them, and fails a test on any call it wasn't given an answer for: a delete in a dry run, or one
-in the wrong order.
+Each test describes a repository, what Inspector says about it, and what ECS and Lambda run, then runs the Lambda's
+code against boto3 clients whose answers botocore's Stubber serves. The Stubber checks every answer against botocore's
+model, so they are shaped as botocore gives them, and fails a test on any call it wasn't given an answer for: a delete
+in a dry run, or one in the wrong order.
 """
 
+import contextlib
 import hashlib
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from unittest import mock
 
 import boto3
 import pytest
@@ -24,11 +27,13 @@ NOW = datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc)
 # The function's own schedule of reads again, before the quick_recheck fixture shortens it.
 REAL_RECHECK = (cleanup.RECHECK_READS, cleanup.RECHECK_INTERVAL)
 REGISTRY = "111122223333"
+OTHER_ACCOUNT = "444455556666"
 REPOSITORY = "test-repo"
 REGION = "us-west-2"
 OCI_INDEX = "application/vnd.oci.image.index.v1+json"
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
+PULL_ACTIONS = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
 
 
 def digest(name: str) -> str:
@@ -39,10 +44,63 @@ def days_ago(days: Optional[float]) -> Optional[datetime]:
     return None if days is None else NOW - timedelta(days=days)
 
 
+def uri(
+    tag: Optional[str] = None,
+    image_digest: Optional[str] = None,
+    repository: str = REPOSITORY,
+    account: str = REGISTRY,
+    region: str = REGION,
+) -> str:
+    """An image reference in ECR, as a task definition or a function names it."""
+    reference = f"{account}.dkr.ecr.{region}.amazonaws.com/{repository}"
+    if tag:
+        reference += f":{tag}"
+    if image_digest:
+        reference += f"@{image_digest}"
+    return reference
+
+
+def ecs_arn(kind: str, name: str) -> str:
+    return f"arn:aws:ecs:{REGION}:{REGISTRY}:{kind}/{name}"
+
+
+def policy(*statements: Dict[str, Any]) -> str:
+    return json.dumps({"Version": "2012-10-17", "Statement": list(statements)})
+
+
+def pull_statement(principal: Any, **extra: Any) -> Dict[str, Any]:
+    """A statement that lets ``principal`` pull."""
+    return dict(
+        {"Sid": "Pull", "Effect": "Allow", "Principal": principal},
+        Action=PULL_ACTIONS,
+        **extra,
+    )
+
+
+# The statement Lambda adds to a repository for this account's functions, as it added it in the test account.
+LAMBDA_STATEMENT = {
+    "Sid": "LambdaECRImageRetrievalPolicy",
+    "Effect": "Allow",
+    "Principal": {"Service": "lambda.amazonaws.com"},
+    "Action": PULL_ACTIONS
+    + [
+        "ecr:SetRepositoryPolicy",
+        "ecr:DeleteRepositoryPolicy",
+        "ecr:GetRepositoryPolicy",
+    ],
+    "Condition": {
+        "StringLike": {
+            "aws:sourceArn": f"arn:aws:lambda:{REGION}:{REGISTRY}:function:*"
+        }
+    },
+}
+
+
 def settings(**overrides: Any) -> selection.Settings:
     values = dict(
         repository_name=REPOSITORY,
         registry_id=REGISTRY,
+        region=REGION,
         dry_run=False,
         min_severity="HIGH",
         min_age=timedelta(days=7),
@@ -58,14 +116,186 @@ def settings(**overrides: Any) -> selection.Settings:
     return selection.Settings(**values)
 
 
+class Stubs:
+    """The run's four clients, each with its Stubber active."""
+
+    def __init__(self) -> None:
+        self.clients = make_clients()
+        self.ecr = Stubber(self.clients.ecr)
+        self.inspector = Stubber(self.clients.inspector)
+        self.ecs = Stubber(self.clients.ecs)
+        self.lambda_ = Stubber(self.clients.lambda_)
+        self._all = (self.ecr, self.inspector, self.ecs, self.lambda_)
+
+    def __enter__(self) -> "Stubs":
+        for stub in self._all:
+            stub.activate()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        for stub in self._all:
+            stub.deactivate()
+
+    def assert_no_pending_responses(self) -> None:
+        for stub in self._all:
+            stub.assert_no_pending_responses()
+
+
 class Repo:
-    """A repository, and what Inspector says about it, as the AWS APIs answer."""
+    """A repository, what Inspector says about it, and what ECS and Lambda run, as the AWS APIs answer."""
 
     def __init__(self) -> None:
         self.details: List[Dict[str, Any]] = []
         self.manifests: Dict[str, str] = {}
         self.findings: List[Dict[str, Any]] = []
         self.coverage: List[Dict[str, Any]] = []
+        # The repository's policy; None for none.
+        self.policy: Optional[str] = None
+        # ECS: each cluster's running tasks and services, by the cluster's ARN, and the task definitions by ARN.
+        self.tasks: Dict[str, List[Dict[str, Any]]] = {}
+        self.services: Dict[str, List[Dict[str, Any]]] = {}
+        self.task_definitions: Dict[str, Dict[str, Any]] = {}
+        # The running tasks the read before deleting shows; None for the same as the first read.
+        self.tasks_on_recheck: Optional[Dict[str, List[Dict[str, Any]]]] = None
+        # Lambda: every function version, with its code.
+        self.functions: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
+
+    # --- What ECS and Lambda run ---
+
+    def cluster(self, name: str = "prod") -> str:
+        arn = ecs_arn("cluster", name)
+        self.tasks.setdefault(arn, [])
+        self.services.setdefault(arn, [])
+        return arn
+
+    def task(
+        self,
+        image: Optional[str],
+        image_digest: Optional[str] = None,
+        cluster: str = "prod",
+        service: Optional[str] = "api",
+        family: str = "api:3",
+        on_recheck: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Add a running task of one container. ``service`` None makes it a task outside a service. ``on_recheck`` adds
+        it to the read before deleting only: a task that started during the run.
+        """
+        arn = self.cluster(cluster)
+        container: Dict[str, Any] = {"name": "app", "lastStatus": "RUNNING"}
+        if image is not None:
+            container["image"] = image
+        if image_digest is not None:
+            container["imageDigest"] = image_digest
+        number = sum(len(tasks) for tasks in self.tasks.values()) + (
+            sum(len(tasks) for tasks in self.tasks_on_recheck.values())
+            if self.tasks_on_recheck
+            else 0
+        )
+        task = {
+            "taskArn": ecs_arn("task", f"{cluster}/{number:032x}"),
+            "clusterArn": arn,
+            "taskDefinitionArn": ecs_arn("task-definition", family),
+            "group": f"service:{service}" if service else f"family:{family}",
+            "lastStatus": "RUNNING",
+            "desiredStatus": "RUNNING",
+            "containers": [container],
+        }
+        if on_recheck:
+            if self.tasks_on_recheck is None:
+                self.tasks_on_recheck = {
+                    cluster_arn: list(tasks)
+                    for cluster_arn, tasks in self.tasks.items()
+                }
+            self.tasks_on_recheck.setdefault(arn, []).append(task)
+        else:
+            self.tasks[arn].append(task)
+            if self.tasks_on_recheck is not None:
+                self.tasks_on_recheck.setdefault(arn, []).append(task)
+        return task
+
+    def task_definition(self, family: str, *images: str) -> str:
+        arn = ecs_arn("task-definition", family)
+        self.task_definitions[arn] = {
+            "taskDefinitionArn": arn,
+            "family": family.split(":")[0],
+            "revision": int(family.split(":")[1]),
+            "containerDefinitions": [
+                {"name": f"container-{number}", "image": image}
+                for number, image in enumerate(images)
+            ],
+        }
+        return arn
+
+    def service(
+        self,
+        name: str,
+        deployments: Sequence[Tuple[str, str]],
+        cluster: str = "prod",
+        desired: int = 0,
+        task_sets: Sequence[Tuple[str, str]] = (),
+    ) -> Dict[str, Any]:
+        """
+        Add a service. ``deployments`` and ``task_sets`` are (status, task definition ARN) pairs; the first deployment
+        is the service's own task definition.
+        """
+        arn = self.cluster(cluster)
+        service: Dict[str, Any] = {
+            "serviceArn": ecs_arn("service", f"{cluster}/{name}"),
+            "serviceName": name,
+            "clusterArn": arn,
+            "status": "ACTIVE",
+            "desiredCount": desired,
+            "runningCount": 0,
+            "deployments": [
+                {
+                    "id": f"ecs-svc/{number}",
+                    "status": status,
+                    "taskDefinition": task_definition,
+                    "desiredCount": desired,
+                }
+                for number, (status, task_definition) in enumerate(deployments)
+            ],
+        }
+        if deployments:
+            service["taskDefinition"] = deployments[0][1]
+        if task_sets:
+            service["taskSets"] = [
+                {
+                    "id": f"ecs-svc/set-{number}",
+                    "status": status,
+                    "taskDefinition": task_definition,
+                }
+                for number, (status, task_definition) in enumerate(task_sets)
+            ]
+        self.services[arn].append(service)
+        return service
+
+    def function(
+        self,
+        name: str,
+        version: str,
+        resolved: Optional[str] = None,
+        image_uri: Optional[str] = None,
+        package: str = "Image",
+    ) -> None:
+        """Add a function version. A Zip function has no image, and the job doesn't read its code."""
+        configuration = {
+            "FunctionName": name,
+            "FunctionArn": f"arn:aws:lambda:{REGION}:{REGISTRY}:function:{name}:{version}",
+            "Version": version,
+            "PackageType": package,
+        }
+        code = None
+        if package == "Image":
+            code = {"RepositoryType": "ECR", "ImageUri": image_uri or resolved}
+            if resolved:
+                code["ResolvedImageUri"] = resolved
+        self.functions.append((configuration, code))
+
+    def allow(self, *statements: Dict[str, Any]) -> None:
+        """Give the repository a policy with these statements."""
+        self.policy = policy(*statements)
 
     def manifest(
         self,
@@ -261,22 +491,39 @@ class Repo:
         deletions: Iterable[Sequence[str]] = (),
         refused: Optional[Dict[str, str]] = None,
         throttled: Optional[int] = None,
-        recheck: Sequence[str] = (),
+        recheck: Optional[Sequence[str]] = None,
         recheck_pulls: Sequence[Dict[str, float]] = (),
         **overrides: Any,
     ) -> Dict[str, Any]:
         """
         Run the cleanup. ``deletions`` are the BatchDeleteImage calls the run must make, in order; any other delete
         fails the test. ECR refuses the images in ``refused`` with their failure codes, and the call numbered
-        ``throttled`` (from 0) fails with ThrottlingException. ``recheck`` are the images the run must read again,
-        in order, before it deletes; ``recheck_pulls`` gives, for each of those reads, the pull times (days before
-        NOW) it shows.
+        ``throttled`` (from 0) fails with ThrottlingException.
+
+        ``recheck`` are the images the run must read again, in order, before it deletes, followed by its read of the
+        running tasks (``tasks_on_recheck``); ``recheck_pulls`` gives, for each of those reads, the pull times (days
+        before NOW) it shows. An empty ``recheck`` says the run reads nothing again. None, for a test about something
+        else, stands in for the reads again: they find nothing new, and the run must make them exactly when it has
+        candidates.
         """
-        ecr, inspector = clients()
-        with Stubber(ecr) as ecr_stub, Stubber(inspector) as inspector_stub:
-            self.stub_reads(ecr_stub, inspector_stub)
-            if recheck:
-                self.stub_recheck(ecr_stub, recheck, recheck_pulls)
+        rechecked: List[List[str]] = []
+
+        def found_nothing_new(
+            _settings: selection.Settings, _clients: cleanup.Clients, digests: Any
+        ) -> Tuple[Dict[str, datetime], selection.Runtime]:
+            rechecked.append(list(digests))
+            return {}, selection.Runtime()
+
+        with Stubs() as stubs:
+            self.stub_reads(stubs)
+            if recheck is None:
+                stand_in = mock.patch.object(cleanup, "recheck", found_nothing_new)
+            else:
+                stand_in = contextlib.nullcontext()
+                if recheck:
+                    self.stub_recheck(stubs.ecr, recheck, recheck_pulls)
+                    self.stub_tasks(stubs.ecs, self.tasks_on_recheck or self.tasks)
+            ecr_stub = stubs.ecr
             for number, batch in enumerate(deletions):
                 if number == throttled:
                     ecr_stub.add_client_error(
@@ -314,9 +561,11 @@ class Repo:
                         "imageIds": [{"imageDigest": image} for image in batch],
                     },
                 )
-            summary = cleanup.run(settings(**overrides), ecr, inspector, NOW)
-            ecr_stub.assert_no_pending_responses()
-            inspector_stub.assert_no_pending_responses()
+            with stand_in:
+                summary = cleanup.run(settings(**overrides), stubs.clients, NOW)
+            stubs.assert_no_pending_responses()
+        if recheck is None:
+            assert len(rechecked) == int(summary["candidates"] > 0), rechecked
         return summary
 
     def stub_recheck(
@@ -345,12 +594,113 @@ class Repo:
                 },
             )
 
-    def stub_reads(self, ecr_stub: Stubber, inspector_stub: Stubber) -> None:
-        self.stub_ecr_reads(ecr_stub)
-        inspector_stub.add_response("list_findings", {"findings": self.findings})
-        inspector_stub.add_response(
+    def stub_reads(self, stubs: Stubs) -> None:
+        """Answer the run's reads before it decides, in order, for each client."""
+        self.stub_ecr_reads(stubs.ecr)
+        stubs.inspector.add_response("list_findings", {"findings": self.findings})
+        stubs.inspector.add_response(
             "list_coverage", {"coveredResources": self.coverage}
         )
+        self.stub_policy(stubs.ecr)
+        self.stub_tasks(stubs.ecs, self.tasks, services=True)
+        self.stub_task_definitions(stubs.ecs)
+        self.stub_functions(stubs.lambda_)
+
+    def stub_policy(self, ecr_stub: Stubber) -> None:
+        expected = {"registryId": REGISTRY, "repositoryName": REPOSITORY}
+        if self.policy is None:
+            ecr_stub.add_client_error(
+                "get_repository_policy",
+                service_error_code="RepositoryPolicyNotFoundException",
+                http_status_code=400,
+                expected_params=expected,
+            )
+        else:
+            ecr_stub.add_response(
+                "get_repository_policy",
+                {
+                    "registryId": REGISTRY,
+                    "repositoryName": REPOSITORY,
+                    "policyText": self.policy,
+                },
+                expected,
+            )
+
+    def stub_tasks(
+        self,
+        ecs_stub: Stubber,
+        tasks: Dict[str, List[Dict[str, Any]]],
+        services: bool = False,
+    ) -> None:
+        """Answer ListClusters, then each cluster's ListTasks and DescribeTasks, and if asked, its services."""
+        clusters = sorted(set(tasks) | (set(self.services) if services else set()))
+        ecs_stub.add_response("list_clusters", {"clusterArns": clusters}, {})
+        for cluster in clusters:
+            arns = [task["taskArn"] for task in tasks.get(cluster, [])]
+            ecs_stub.add_response(
+                "list_tasks",
+                {"taskArns": arns},
+                {"cluster": cluster, "desiredStatus": "RUNNING"},
+            )
+            if arns:
+                ecs_stub.add_response(
+                    "describe_tasks",
+                    {"tasks": tasks[cluster], "failures": []},
+                    {"cluster": cluster, "tasks": arns},
+                )
+            if not services:
+                continue
+            arns = [service["serviceArn"] for service in self.services.get(cluster, [])]
+            ecs_stub.add_response(
+                "list_services", {"serviceArns": arns}, {"cluster": cluster}
+            )
+            for start in range(0, len(arns), cleanup.SERVICES_BATCH_SIZE):
+                chunk = arns[start : start + cleanup.SERVICES_BATCH_SIZE]
+                ecs_stub.add_response(
+                    "describe_services",
+                    {
+                        "services": [
+                            service
+                            for service in self.services[cluster]
+                            if service["serviceArn"] in chunk
+                        ],
+                        "failures": [],
+                    },
+                    {"cluster": cluster, "services": chunk},
+                )
+
+    def stub_task_definitions(self, ecs_stub: Stubber) -> None:
+        """Answer DescribeTaskDefinition, once for each task definition a service deploys, in ARN order."""
+        deployed = {
+            arn
+            for services in self.services.values()
+            for service in services
+            for arn in selection.deployed_task_definitions(service)
+        }
+        for arn in sorted(deployed):
+            ecs_stub.add_response(
+                "describe_task_definition",
+                {"taskDefinition": self.task_definitions[arn]},
+                {"taskDefinition": arn},
+            )
+
+    def stub_functions(self, lambda_stub: Stubber) -> None:
+        lambda_stub.add_response(
+            "list_functions",
+            {"Functions": [configuration for configuration, _ in self.functions]},
+            {"FunctionVersion": "ALL"},
+        )
+        for configuration, code in self.functions:
+            if code is None:
+                continue
+            lambda_stub.add_response(
+                "get_function",
+                {"Configuration": configuration, "Code": code},
+                {
+                    "FunctionName": configuration["FunctionName"],
+                    "Qualifier": configuration["Version"],
+                },
+            )
 
     def stub_ecr_reads(self, ecr_stub: Stubber) -> None:
         ecr_stub.add_response("describe_images", {"imageDetails": self.details})
@@ -389,11 +739,16 @@ def quick_recheck(monkeypatch):
     monkeypatch.setattr(cleanup, "RECHECK_INTERVAL", 0)
 
 
-def clients():
+def make_clients() -> cleanup.Clients:
     session = boto3.Session(
         aws_access_key_id="testing", aws_secret_access_key="testing", region_name=REGION
     )
-    return session.client("ecr"), session.client("inspector2")
+    return cleanup.Clients(
+        ecr=session.client("ecr"),
+        inspector=session.client("inspector2"),
+        ecs=session.client("ecs"),
+        lambda_=session.client("lambda"),
+    )
 
 
 def vulnerable_index(
@@ -713,9 +1068,10 @@ def multi_platform(repo: Repo, arm_pulled: Optional[float] = None) -> List[str]:
 
 
 def test_every_platform_image_needs_its_use_judged():
-    # A task pulled the arm64 image a month ago and may still run it.
+    # A task pulled the arm64 image a month ago and, with another account allowed to pull, may still run it.
     repo = Repo()
     multi_platform(repo, arm_pulled=30)
+    repo.allow(pull_statement({"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:root"}))
     assert repo.run()["protected"]["in_use_unknown"] == 1
 
 
@@ -723,7 +1079,7 @@ def test_platform_images_judged_by_inspector_and_by_ecr_pull_record(caplog):
     repo = Repo()
     index, amd, arm = multi_platform(repo)
     with caplog.at_level("INFO"):
-        summary = repo.run(deletions=[[index], [amd, arm]], recheck=[arm])
+        summary = repo.run(deletions=[[index], [amd, arm]], recheck=[amd, arm])
     assert summary["deleted"] == 1
     (line,) = image_lines(caplog)
     assert line["use_judged_by"] == "ecr_pull_record"
@@ -783,23 +1139,85 @@ def test_pulled_within_the_soak_is_in_use(coverage, caplog):
 
 
 @pytest.mark.parametrize("coverage", NO_IN_USE_DATA)
-def test_pulled_before_the_soak_is_unknown(coverage, caplog):
-    # A long-running task pulled its image once, weeks ago, and still runs it: nothing here can tell.
+def test_pulled_before_the_soak_with_a_complete_view_is_deleted(coverage, caplog):
+    # Pulled weeks ago, and nothing runs it now: no ECS task or deployment, no Lambda version, and no other account
+    # may pull it.
+    repo = Repo()
+    made = without_in_use_data(
+        repo, "old", coverage, tags=["abc"], pulled=30, platform_pulled=30
+    )
+    repo.allow(LAMBDA_STATEMENT)
+    with caplog.at_level("INFO"):
+        summary = repo.run(deletions=deletes(made), recheck=[made["platform"]])
+    assert summary["deleted"] == 1
+    assert summary["protected"] == dict.fromkeys(selection.REASONS, 0)
+    assert summary["judged_never_pulled"] == 0
+    assert summary["view"]["complete"] is True
+    assert summary["view"]["incomplete_because"] == []
+    (line,) = image_lines(caplog)
+    assert line["action"] == "deleted"
+    assert line["use_judged_by"] == "ecr_pull_record"
+    assert line["never_pulled"] is False
+    assert line["last_pulled_at"] == days_ago(30).isoformat()
+    assert line["in_use_by"] == []
+
+
+# Repository policies that let someone outside the account pull, and what the summary says of each.
+INCOMPLETE_VIEWS = {
+    "another-account": (
+        [pull_statement({"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:root"})],
+        f"repository policy allows account {OTHER_ACCOUNT}",
+    ),
+    "star": ([pull_statement("*")], "repository policy allows *"),
+    "organization": (
+        [
+            pull_statement(
+                {"AWS": "*"},
+                Condition={"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}},
+            )
+        ],
+        "repository policy allows an organization (aws:PrincipalOrgID in statement 'Pull')",
+    ),
+}
+
+
+@pytest.mark.parametrize("view", INCOMPLETE_VIEWS)
+@pytest.mark.parametrize("coverage", NO_IN_USE_DATA)
+def test_pulled_before_the_soak_with_an_incomplete_view_is_unknown(
+    coverage, view, caplog
+):
+    # Another account may run it, and the job can't see what runs there: a long-running task that pulled it weeks
+    # ago may still run it.
     repo = Repo()
     without_in_use_data(
         repo, "long-running", coverage, tags=["abc"], pulled=30, platform_pulled=30
     )
+    statements, why = INCOMPLETE_VIEWS[view]
+    repo.allow(LAMBDA_STATEMENT, *statements)
     with caplog.at_level("INFO"):
         summary = repo.run()
     assert summary["deleted"] == 0
     assert summary["protected"]["in_use"] == 0
     assert summary["protected"]["in_use_unknown"] == 1
     assert summary["judged_never_pulled"] == 0
+    assert summary["view"]["complete"] is False
+    assert why in summary["view"]["incomplete_because"]
     (line,) = image_lines(caplog)
     assert line["action"] == "kept"
     assert line["reasons"] == ["in_use_unknown"]
     assert line["use_judged_by"] == "unknown"
     assert line["never_pulled"] is False
+
+
+@pytest.mark.parametrize("view", INCOMPLETE_VIEWS)
+def test_never_pulled_is_deleted_with_an_incomplete_view_too(view):
+    # Never pulled, so never run, here or in another account: a pull from another account is recorded here too.
+    repo = Repo()
+    made = never_pulled_index(repo, "old", tags=["abc"])
+    repo.allow(*INCOMPLETE_VIEWS[view][0])
+    summary = repo.run(deletions=deletes(made), recheck=[made["platform"]])
+    assert summary["deleted"] == 1
+    assert summary["view"]["complete"] is False
 
 
 def test_an_index_pulled_recently_whose_platform_image_was_never_pulled_is_not_in_use():
@@ -821,6 +1239,7 @@ def test_an_index_pulled_recently_whose_platform_image_was_never_pulled_is_not_i
 def test_indexes_sharing_a_platform_image_one_of_them_pulled(pulled, reason):
     # A pull through the first index records the shared platform image's pull: one record, which counts for both.
     repo = Repo()
+    repo.allow(*INCOMPLETE_VIEWS["another-account"][0])
     first = without_in_use_data(
         repo,
         "first",
@@ -847,10 +1266,7 @@ def test_an_attestations_pull_changes_nothing(coverage):
     repo.vulnerable(made["platform"])
     if coverage == "unused":
         repo.unused(made["platform"])
-    summary = repo.run(
-        deletions=deletes(made),
-        recheck=[made["platform"]] if coverage == "no-coverage-record" else [],
-    )
+    summary = repo.run(deletions=deletes(made), recheck=[made["platform"]])
     assert summary["deleted"] == 1
     assert summary["protected"]["in_use"] == 0
     assert summary["judged_never_pulled"] == int(coverage == "no-coverage-record")
@@ -899,18 +1315,58 @@ def test_a_pull_one_read_again_shows_keeps_the_image(read, caplog):
     assert summary["protected"]["in_use"] == 1
     assert summary["judged_never_pulled"] == 0
     (recheck,) = [line for line in logged(caplog) if line.get("action") == "recheck"]
-    assert recheck["never_pulled"] == [made["platform"]]
+    assert recheck["read_again"] == [made["platform"]]
     assert list(recheck["pulled"]) == [made["platform"]]
+    assert recheck["dropped"] == [made["index"]]
+    assert summary["dropped_on_recheck"] == 1
 
 
-def test_an_old_pull_a_read_again_shows_keeps_the_image_as_unknown():
+@pytest.mark.parametrize("view", ["complete", "incomplete"])
+def test_an_old_pull_a_read_again_shows_is_judged_as_one(view):
+    # Judged as an image pulled before the soak: deleted with a complete view, kept as unknown without.
     repo = Repo()
     made = never_pulled_index(repo, "old", tags=["abc"])
+    if view == "incomplete":
+        repo.allow(*INCOMPLETE_VIEWS["another-account"][0])
     summary = repo.run(
-        recheck=[made["platform"]], recheck_pulls=[{made["platform"]: 30}]
+        deletions=deletes(made) if view == "complete" else [],
+        recheck=[made["platform"]],
+        recheck_pulls=[{made["platform"]: 30}],
     )
+    assert summary["deleted"] == int(view == "complete")
+    assert summary["protected"]["in_use_unknown"] == int(view == "incomplete")
+    assert summary["pulled_on_recheck"] == 1
+
+
+def test_a_newer_pull_a_read_again_shows_keeps_an_image_pulled_before_the_soak(
+    caplog,
+):
+    repo = Repo()
+    made = without_in_use_data(
+        repo, "old", "no-coverage-record", tags=["abc"], platform_pulled=30
+    )
+    with caplog.at_level("INFO"):
+        summary = repo.run(
+            recheck=[made["platform"]], recheck_pulls=[{}, {made["platform"]: 0.001}]
+        )
     assert summary["deleted"] == 0
-    assert summary["protected"]["in_use_unknown"] == 1
+    assert summary["protected"]["in_use"] == 1
+    assert summary["pulled_on_recheck"] == 1
+    assert summary["dropped_on_recheck"] == 1
+
+
+def test_the_same_old_pull_on_a_read_again_is_nothing_new(caplog):
+    repo = Repo()
+    made = without_in_use_data(
+        repo, "old", "no-coverage-record", tags=["abc"], platform_pulled=30
+    )
+    with caplog.at_level("INFO"):
+        summary = repo.run(deletions=deletes(made), recheck=[made["platform"]])
+    assert summary["deleted"] == 1
+    assert summary["pulled_on_recheck"] == 0
+    (recheck,) = [line for line in logged(caplog) if line.get("action") == "recheck"]
+    assert recheck["pulled"] == {}
+    assert recheck["dropped"] == []
 
 
 def test_the_reads_again_cover_the_candidates_the_cap_leaves():
@@ -961,25 +1417,23 @@ def test_a_read_again_that_fails_deletes_nothing():
     # No delete is stubbed, so a delete would fail the test with another error than the ClientError.
     repo = Repo()
     never_pulled_index(repo, "old", tags=["abc"])
-    ecr, inspector = clients()
-    with Stubber(ecr) as ecr_stub, Stubber(inspector) as inspector_stub:
-        repo.stub_reads(ecr_stub, inspector_stub)
-        ecr_stub.add_client_error(
+    with Stubs() as stubs:
+        repo.stub_reads(stubs)
+        stubs.ecr.add_client_error(
             "describe_images",
             service_error_code="ThrottlingException",
             http_status_code=400,
         )
         with pytest.raises(ClientError, match="ThrottlingException"):
-            cleanup.run(settings(), ecr, inspector, NOW)
+            cleanup.run(settings(), stubs.clients, NOW)
 
 
 def test_an_image_a_read_again_does_not_return_fails_the_run():
     repo = Repo()
     made = never_pulled_index(repo, "old", tags=["abc"])
-    ecr, inspector = clients()
-    with Stubber(ecr) as ecr_stub, Stubber(inspector) as inspector_stub:
-        repo.stub_reads(ecr_stub, inspector_stub)
-        ecr_stub.add_response(
+    with Stubs() as stubs:
+        repo.stub_reads(stubs)
+        stubs.ecr.add_response(
             "describe_images",
             {"imageDetails": []},
             {
@@ -989,7 +1443,7 @@ def test_an_image_a_read_again_does_not_return_fails_the_run():
             },
         )
         with pytest.raises(cleanup.CleanupError, match="didn't return the images"):
-            cleanup.run(settings(), ecr, inspector, NOW)
+            cleanup.run(settings(), stubs.clients, NOW)
 
 
 def test_the_reads_again_span_two_minutes(monkeypatch):
@@ -1017,44 +1471,42 @@ def test_an_error_mid_pagination_deletes_nothing(operation):
     # does. No delete is stubbed, so a delete would fail the test with another error than the ClientError.
     repo = Repo()
     vulnerable_index(repo, "old", tags=["abc"])
-    ecr, inspector = clients()
-    with Stubber(ecr) as ecr_stub, Stubber(inspector) as inspector_stub:
+    with Stubs() as stubs:
         if operation == "describe_images":
-            ecr_stub.add_response(
+            stubs.ecr.add_response(
                 operation, {"imageDetails": repo.details, "nextToken": "page-2"}
             )
-            ecr_stub.add_client_error(
+            stubs.ecr.add_client_error(
                 operation,
                 service_error_code="ThrottlingException",
                 http_status_code=400,
             )
         else:
-            repo.stub_ecr_reads(ecr_stub)
+            repo.stub_ecr_reads(stubs.ecr)
             pages = {
                 "list_findings": {"findings": repo.findings},
                 "list_coverage": {"coveredResources": repo.coverage},
             }
             if operation == "list_coverage":
-                inspector_stub.add_response("list_findings", pages["list_findings"])
-            inspector_stub.add_response(
+                stubs.inspector.add_response("list_findings", pages["list_findings"])
+            stubs.inspector.add_response(
                 operation, dict(pages[operation], nextToken="page-2")
             )
-            inspector_stub.add_client_error(
+            stubs.inspector.add_client_error(
                 operation,
                 service_error_code="ThrottlingException",
                 http_status_code=400,
             )
         with pytest.raises(ClientError, match="ThrottlingException"):
-            cleanup.run(settings(), ecr, inspector, NOW)
+            cleanup.run(settings(), stubs.clients, NOW)
 
 
 def test_a_manifest_ecr_does_not_return_deletes_nothing():
     repo = Repo()
     made = vulnerable_index(repo, "old", tags=["abc"])
-    ecr, inspector = clients()
-    with Stubber(ecr) as ecr_stub, Stubber(inspector):
-        ecr_stub.add_response("describe_images", {"imageDetails": repo.details})
-        ecr_stub.add_response(
+    with Stubs() as stubs:
+        stubs.ecr.add_response("describe_images", {"imageDetails": repo.details})
+        stubs.ecr.add_response(
             "batch_get_image",
             {
                 "images": [],
@@ -1068,7 +1520,7 @@ def test_a_manifest_ecr_does_not_return_deletes_nothing():
             },
         )
         with pytest.raises(cleanup.CleanupError):
-            cleanup.run(settings(), ecr, inspector, NOW)
+            cleanup.run(settings(), stubs.clients, NOW)
 
 
 def test_a_refused_deletion_fails_the_run():
@@ -1107,7 +1559,7 @@ def test_a_refused_child_logs_the_index_ecr_deleted(caplog):
             deletions=deletes(made),
             refused={made["platform"]: "ImageReferencedByManifestList"},
         )
-    (line,) = logged(caplog)
+    (line,) = image_lines(caplog)
     assert line["action"] == "delete_failed"
     assert line["digests"] == [made["index"], made["platform"], made["attestation"]]
     # ECR deleted the index, and the attestation in the batch it refused the platform image of.
@@ -1124,7 +1576,7 @@ def test_a_failed_call_logs_what_ecr_deleted_before(caplog):
         cleanup.DeletionError, match="ThrottlingException"
     ):
         repo.run(deletions=deletes(first) + deletes(second), throttled=3)
-    deleted, failed = logged(caplog)
+    deleted, failed = image_lines(caplog)
     assert deleted["action"] == "deleted"
     assert deleted["tags"] == ["first"]
     assert failed["action"] == "delete_failed"
@@ -1158,16 +1610,15 @@ def test_an_old_botocore_model_fails_the_run():
     class OldInspector:
         meta = Meta
 
-    ecr, _ = clients()
     with pytest.raises(cleanup.CleanupError, match="inUseCount"):
-        cleanup.check_models(ecr, OldInspector)
+        cleanup.check_models(replace(make_clients(), inspector=OldInspector))
 
 
 def test_an_ecr_model_without_the_pull_time_fails_the_run_before_any_call():
     # A botocore that drops lastRecordedPullTime would make every image without Inspector's in-use data look never
     # pulled.
-    real, inspector = clients()
-    model = real.meta.service_model
+    real = make_clients()
+    model = real.ecr.meta.service_model
 
     class Shape:
         members = {
@@ -1190,15 +1641,50 @@ def test_an_ecr_model_without_the_pull_time_fails_the_run_before_any_call():
         def __getattr__(self, name):
             raise AssertionError(f"The run called ECR's {name}.")
 
-    # Inspector's Stubber has no answers: a call to Inspector fails the test too.
-    with Stubber(inspector), pytest.raises(
+    # The other Stubbers have no answers: a call to Inspector, ECS or Lambda fails the test too.
+    with Stubs() as stubs, pytest.raises(
         cleanup.CleanupError, match="lastRecordedPullTime"
     ):
-        cleanup.run(settings(), OldEcr(), inspector, NOW)
+        cleanup.run(settings(), replace(stubs.clients, ecr=OldEcr()), NOW)
+
+
+@pytest.mark.parametrize(
+    "service, shape, field",
+    [
+        ("ecs", "Container", "imageDigest"),
+        ("ecs", "Service", "taskSets"),
+        ("lambda", "FunctionCodeLocation", "ResolvedImageUri"),
+    ],
+)
+def test_a_model_without_what_ecs_or_lambda_run_fails_the_run(service, shape, field):
+    # Without these, what ECS and Lambda run would go unseen, and the view look complete.
+    real = make_clients()
+    client = real.ecs if service == "ecs" else real.lambda_
+    model = client.meta.service_model
+
+    class Shape:
+        members = {
+            name: None for name in model.shape_for(shape).members if name != field
+        }
+
+    class Model:
+        @staticmethod
+        def shape_for(name):
+            return Shape if name == shape else model.shape_for(name)
+
+    class Meta:
+        service_model = Model
+
+    class Old:
+        meta = Meta
+
+    old = replace(real, **{"ecs" if service == "ecs" else "lambda_": Old})
+    with pytest.raises(cleanup.CleanupError, match=field):
+        cleanup.check_models(old)
 
 
 def test_the_installed_botocore_models_the_fields():
-    cleanup.check_models(*clients())
+    cleanup.check_models(make_clients())
 
 
 # --- Indexes that share manifests ---
@@ -1289,6 +1775,7 @@ def test_dry_run_calls_no_delete(caplog):
         if record.getMessage().startswith("{")
     ]
     assert [line["action"] for line in lines if "action" in line] == [
+        "recheck",
         "would_delete",
         "left_by_cap",
     ]
@@ -1310,8 +1797,9 @@ def test_one_line_per_deleted_image_and_one_summary(caplog):
         for record in caplog.records
         if record.getMessage().startswith("{")
     ]
-    assert len(lines) == 2
-    line, summary = lines
+    assert len(lines) == 3
+    recheck, line, summary = lines
+    assert recheck["action"] == "recheck"
     assert line["action"] == "deleted"
     assert line["digests"] == [made["index"], made["platform"], made["attestation"]]
     assert line["tags"] == ["abc1234"]
@@ -1369,6 +1857,7 @@ def test_settings_from_the_environment():
         {"RETAIN_TAGS": "migrator"},
         {"ROLLBACK_CANDIDATE_RETAIN_COUNT": '"3"'},
         {"REGISTRY_ID": "12345"},
+        {"REPOSITORY_REGION": "Oregon"},
     ],
 )
 def test_wrong_settings_fail_the_run(overrides):
@@ -1386,10 +1875,12 @@ def test_a_missing_setting_fails_the_run():
 def test_the_handler_reads_in_the_repository_region(monkeypatch):
     seen = {}
 
-    def run(parsed, ecr, inspector, now):
+    def run(parsed, clients, now):
         seen.update(
-            ecr=ecr.meta.region_name,
-            inspector=inspector.meta.region_name,
+            ecr=clients.ecr.meta.region_name,
+            inspector=clients.inspector.meta.region_name,
+            ecs=clients.ecs.meta.region_name,
+            lambda_=clients.lambda_.meta.region_name,
             dry_run=parsed.dry_run,
         )
         return {}
@@ -1399,12 +1890,17 @@ def test_the_handler_reads_in_the_repository_region(monkeypatch):
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     cleanup.lambda_handler({}, None)
-    assert seen == {"ecr": "eu-central-1", "inspector": "eu-central-1", "dry_run": True}
+    assert seen == {
+        "ecr": "eu-central-1",
+        "inspector": "eu-central-1",
+        "ecs": "eu-central-1",
+        "lambda_": "eu-central-1",
+        "dry_run": True,
+    }
 
 
 def test_the_findings_filter():
-    repo = Repo()
-    ecr, inspector = clients()
+    inspector = make_clients().inspector
     with Stubber(inspector) as stub:
         stub.add_response(
             "list_findings",
@@ -1430,4 +1926,847 @@ def test_the_findings_filter():
             },
         )
         assert cleanup.read_findings(settings(min_severity="MEDIUM"), inspector) == []
-    assert repo and ecr
+
+
+# --- What ECS and Lambda run ---
+
+
+def pulled_long_ago(repo: Repo, name: str, **kwargs: Any) -> Dict[str, str]:
+    """
+    An index Inspector reports vulnerable and gives no in-use data on, whose platform image ECR last recorded a pull
+    of 30 days ago: with a complete view and nothing running it, it is deleted.
+    """
+    return without_in_use_data(
+        repo, name, "no-coverage-record", pulled=30, platform_pulled=30, **kwargs
+    )
+
+
+def kept_line(caplog: pytest.LogCaptureFixture) -> Dict[str, Any]:
+    (line,) = image_lines(caplog)
+    assert line["action"] == "kept"
+    return line
+
+
+@pytest.mark.parametrize("member", ["index", "platform"])
+def test_a_running_task_keeps_the_image_it_runs(member, caplog):
+    # ECS reports the index's digest in production; whichever digest of the unit it gives, the whole unit is kept.
+    # The task names a tag that has since moved: only the digest matches.
+    repo = Repo()
+    made = pulled_long_ago(repo, "running", tags=["abc"])
+    repo.task(uri("moved-on"), made[member])
+    with caplog.at_level("INFO"):
+        summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["protected"]["in_use"] == 1
+    assert summary["protected"]["in_use_unknown"] == 0
+    assert summary["images_in_use_by"]["ecs"] == 1
+    line = kept_line(caplog)
+    assert line["reasons"] == ["in_use"]
+    assert line["use_judged_by"] == "ecs"
+    assert line["in_use_by"] == [
+        {
+            "source": "ecs",
+            "via": "running_task",
+            "cluster": "prod",
+            "service": "api",
+            "task_definition": "api:3",
+        }
+    ]
+
+
+def test_a_task_outside_a_service_is_named_by_its_arn(caplog):
+    repo = Repo()
+    made = pulled_long_ago(repo, "migrator", tags=["abc"])
+    task = repo.task(None, made["index"], service=None, family="migrator:7")
+    with caplog.at_level("INFO"):
+        repo.run()
+    assert kept_line(caplog)["in_use_by"] == [
+        {
+            "source": "ecs",
+            "via": "running_task",
+            "cluster": "prod",
+            "task": task["taskArn"],
+            "task_definition": "migrator:7",
+        }
+    ]
+
+
+def test_a_pending_task_without_a_digest_keeps_the_image_its_tag_names():
+    # A container still pending may have no digest yet: it will pull the image the tag names.
+    repo = Repo()
+    pulled_long_ago(repo, "pending", tags=["abc"])
+    repo.task(uri("abc"))
+    summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["protected"]["in_use"] == 1
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        uri("abc", repository="other-repo"),
+        uri("abc", account=OTHER_ACCOUNT),
+        uri("abc", region="us-east-1"),
+        "docker.io/library/test-repo:abc",
+        "test-repo:abc",
+    ],
+    ids=["other-repository", "other-account", "other-region", "docker-hub", "no-host"],
+)
+def test_a_tag_of_another_repository_keeps_nothing(reference):
+    repo = Repo()
+    made = pulled_long_ago(repo, "old", tags=["abc"])
+    repo.task(reference)
+    repo.task_definition("web:1", reference)
+    repo.service("web", [("PRIMARY", ecs_arn("task-definition", "web:1"))])
+    summary = repo.run(deletions=deletes(made), recheck=[made["platform"]])
+    assert summary["deleted"] == 1
+    assert summary["images_in_use_by"]["ecs"] == 0
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        f"{REGISTRY}.dkr.ecr-fips.{REGION}.amazonaws.com",
+        f"{REGISTRY}.dkr-ecr.{REGION}.on.aws",
+        f"{REGISTRY}.DKR.ECR.{REGION.upper()}.AMAZONAWS.COM",
+    ],
+    ids=["fips", "dual-stack", "upper-case"],
+)
+def test_a_tag_through_another_endpoint_of_this_repository_keeps_its_image(host):
+    repo = Repo()
+    pulled_long_ago(repo, "old", tags=["abc"])
+    repo.task_definition("web:1", f"{host}/{REPOSITORY}:abc")
+    repo.service("web", [("PRIMARY", ecs_arn("task-definition", "web:1"))])
+    assert repo.run()["protected"]["in_use"] == 1
+
+
+@pytest.mark.parametrize(
+    "reference, member",
+    [
+        (uri("abc"), None),
+        (uri(image_digest="index"), "index"),
+        (uri(image_digest="platform"), "platform"),
+        (uri("moved-on", image_digest="index"), "index"),
+    ],
+    ids=["by-tag", "by-index-digest", "by-platform-digest", "by-tag-and-digest"],
+)
+def test_a_service_scaled_to_zero_keeps_the_image_its_task_definition_names(
+    reference, member, caplog
+):
+    # No task runs, but the service starts its task definition's image when it scales up.
+    repo = Repo()
+    made = pulled_long_ago(repo, "deployed", tags=["abc"])
+    if member:
+        reference = reference.replace(member, made[member])
+    repo.task_definition("web:4", reference)
+    repo.service("web", [("PRIMARY", ecs_arn("task-definition", "web:4"))], desired=0)
+    with caplog.at_level("INFO"):
+        summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["view"]["ecs_services"] == 1
+    assert summary["view"]["ecs_task_definitions"] == 1
+    line = kept_line(caplog)
+    assert line["use_judged_by"] == "ecs"
+    assert line["in_use_by"] == [
+        {
+            "source": "ecs",
+            "via": "deployment",
+            "cluster": "prod",
+            "service": "web",
+            "task_definition": "web:4",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "deployments, task_sets, kept",
+    [
+        ([("PRIMARY", "new"), ("ACTIVE", "old")], [], True),
+        ([("PRIMARY", "new"), ("INACTIVE", "old")], [], False),
+        ([("PRIMARY", "new")], [("ACTIVE", "old")], True),
+        ([("PRIMARY", "new")], [("DRAINING", "old")], False),
+    ],
+    ids=[
+        "mid-deployment",
+        "inactive-deployment",
+        "blue-green-task-set",
+        "draining-task-set",
+    ],
+)
+def test_a_service_keeps_the_images_of_the_deployments_it_may_go_back_to(
+    deployments, task_sets, kept
+):
+    # An ACTIVE deployment is the one being replaced: a rollback goes back to it. An INACTIVE one is done with, and
+    # a DRAINING task set's tasks are stopping (running tasks are read on their own).
+    repo = Repo()
+    old = pulled_long_ago(repo, "old", tags=["old"], pushed=40)
+    pulled_long_ago(repo, "new", tags=["new"])
+    arns = {
+        "old": repo.task_definition("web:1", uri("old")),
+        "new": repo.task_definition("web:2", uri("new")),
+    }
+    repo.service(
+        "web",
+        [(status, arns[name]) for status, name in deployments],
+        task_sets=[(status, arns[name]) for status, name in task_sets],
+    )
+    summary = repo.run(
+        deletions=[] if kept else deletes(old),
+        recheck=None if kept else [old["platform"]],
+    )
+    assert summary["protected"]["in_use"] == (2 if kept else 1)
+    assert summary["deleted"] == int(not kept)
+
+
+def test_a_task_definition_two_services_deploy_is_read_once(caplog):
+    repo = Repo()
+    pulled_long_ago(repo, "shared", tags=["abc"])
+    arn = repo.task_definition("web:1", "public.ecr.aws/nginx:1", uri("abc"))
+    repo.service("web", [("PRIMARY", arn)])
+    repo.service("web-canary", [("PRIMARY", arn)], cluster="canary")
+    with caplog.at_level("INFO"):
+        summary = repo.run()
+    assert summary["view"]["ecs_clusters"] == 2
+    assert summary["view"]["ecs_services"] == 2
+    assert summary["view"]["ecs_task_definitions"] == 1
+    assert [use["service"] for use in kept_line(caplog)["in_use_by"]] == [
+        "web-canary",
+        "web",
+    ]
+
+
+def test_every_page_of_ecs_and_every_batch_of_services_is_read():
+    # Services are described 10 at a time; the image is named by the last service of the second batch.
+    repo = Repo()
+    made = pulled_long_ago(repo, "old", tags=["abc"])
+    for number in range(11):
+        image = uri("abc") if number == 10 else uri("other")
+        repo.service(
+            f"web-{number:02}",
+            [("PRIMARY", repo.task_definition(f"web-{number:02}:1", image))],
+        )
+    assert repo.run()["protected"]["in_use"] == 1
+    assert made
+
+
+@pytest.mark.parametrize("member", ["index", "platform"])
+def test_a_lambda_version_that_is_not_latest_keeps_its_image(member, caplog):
+    # A rollback to version 3 runs its image, though $LATEST has moved on.
+    repo = Repo()
+    old = pulled_long_ago(repo, "old", tags=["v1"], pushed=40)
+    new = pulled_long_ago(repo, "new", tags=["v2"])
+    repo.function("fn", "$LATEST", resolved=uri(image_digest=new[member]))
+    repo.function(
+        "fn", "3", resolved=uri(image_digest=old[member]), image_uri=uri("v1")
+    )
+    repo.function("zip-fn", "$LATEST", package="Zip")
+    with caplog.at_level("INFO"):
+        summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["protected"]["in_use"] == 2
+    assert summary["images_in_use_by"]["lambda"] == 2
+    assert summary["view"]["lambda_image_versions"] == 2
+    lines = {line["tags"][0]: line for line in image_lines(caplog)}
+    assert lines["v1"]["use_judged_by"] == "lambda"
+    assert lines["v1"]["in_use_by"] == [
+        {
+            "source": "lambda",
+            "via": "function_version",
+            "function": "fn",
+            "version": "3",
+        }
+    ]
+    assert lines["v2"]["in_use_by"][0]["version"] == "$LATEST"
+
+
+def test_an_image_ecs_and_lambda_both_run_names_both(caplog):
+    repo = Repo()
+    made = pulled_long_ago(repo, "both", tags=["abc"])
+    repo.task(None, made["index"])
+    repo.function("fn", "1", resolved=uri(image_digest=made["platform"]))
+    with caplog.at_level("INFO"):
+        summary = repo.run()
+    line = kept_line(caplog)
+    assert line["use_judged_by"] == "ecs"
+    assert [use["source"] for use in line["in_use_by"]] == ["ecs", "lambda"]
+    assert summary["images_in_use_by"] == {
+        "ecs": 1,
+        "lambda": 1,
+        "inspector": 0,
+        "ecr_pull_record": 0,
+    }
+
+
+def test_what_runs_overrules_inspectors_in_use_data():
+    # Inspector says it isn't in use, and hasn't been for 30 days; ECS runs it.
+    repo = Repo()
+    made = vulnerable_index(repo, "running", tags=["abc"])
+    repo.task(None, made["index"])
+    summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["protected"]["in_use"] == 1
+
+
+def test_what_runs_overrules_an_unknown_judgement():
+    # Without the whole view the pull record leaves it unknown; ECS runs it, so it is in use, and known to be.
+    repo = Repo()
+    made = pulled_long_ago(repo, "running", tags=["abc"])
+    repo.allow(*INCOMPLETE_VIEWS["star"][0])
+    repo.task(None, made["index"])
+    summary = repo.run()
+    assert summary["protected"]["in_use"] == 1
+    assert summary["protected"]["in_use_unknown"] == 0
+
+
+def test_the_summary_counts_what_each_source_shows_in_use():
+    repo = Repo()
+    by_ecs = pulled_long_ago(repo, "ecs", tags=["a"])
+    by_lambda = pulled_long_ago(repo, "lambda", tags=["b"])
+    by_inspector = repo.index("inspector", tags=["c"])
+    repo.covered(by_inspector["platform"], in_use_count=1, last_in_use=0)
+    without_in_use_data(
+        repo, "pulled", "no-coverage-record", tags=["d"], platform_pulled=1
+    )
+    # Not vulnerable, but in use: it counts too.
+    clean = repo.index("clean", tags=["e"])
+    repo.task(None, by_ecs["index"])
+    repo.task(None, clean["index"], service="worker")
+    repo.function("fn", "1", resolved=uri(image_digest=by_lambda["platform"]))
+    summary = repo.run()
+    assert summary["images_in_use_by"] == {
+        "ecs": 2,
+        "lambda": 1,
+        "inspector": 1,
+        "ecr_pull_record": 1,
+    }
+    assert summary["view"] == {
+        "complete": True,
+        "incomplete_because": [],
+        "ecs_clusters": 1,
+        "ecs_running_tasks": 2,
+        "ecs_services": 0,
+        "ecs_task_definitions": 0,
+        "lambda_image_versions": 1,
+    }
+
+
+# --- The repository's policy ---
+
+
+@pytest.mark.parametrize(
+    "statements",
+    [
+        [],
+        [LAMBDA_STATEMENT],
+        [pull_statement({"AWS": f"arn:aws:iam::{REGISTRY}:root"})],
+        [pull_statement({"AWS": REGISTRY})],
+        [pull_statement({"AWS": [f"arn:aws:iam::{REGISTRY}:role/deployer"]})],
+        [pull_statement({"AWS": f"arn:aws:sts::{REGISTRY}:assumed-role/ci/x"})],
+        [
+            dict(
+                LAMBDA_STATEMENT,
+                Condition={"StringEquals": {"aws:SourceAccount": REGISTRY}},
+            )
+        ],
+        [
+            dict(
+                LAMBDA_STATEMENT,
+                Condition={
+                    "ArnLike": {
+                        "AWS:SourceArn": [
+                            f"arn:aws:lambda:{REGION}:{REGISTRY}:function:a",
+                            f"arn:aws:lambda:{REGION}:{REGISTRY}:function:b-*",
+                        ]
+                    }
+                },
+            )
+        ],
+        # Pushing isn't pulling.
+        [
+            {
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["ecr:PutImage", "ecr:InitiateLayerUpload"],
+            }
+        ],
+        # A Deny only takes away.
+        [{"Effect": "Deny", "Principal": "*", "Action": "ecr:*"}],
+        # A NotAction that leaves out both of a pull's actions.
+        [
+            {
+                "Effect": "Allow",
+                "Principal": "*",
+                "NotAction": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+            }
+        ],
+    ],
+    ids=[
+        "no-statement",
+        "lambda-for-this-account",
+        "this-account",
+        "this-account-id",
+        "a-role-here",
+        "an-assumed-role-here",
+        "lambda-by-source-account",
+        "lambda-by-function-arns",
+        "push-only",
+        "deny",
+        "not-action-of-both",
+    ],
+)
+def test_policies_that_let_no_one_outside_the_account_pull(statements):
+    assert selection.repository_policy_gaps(policy(*statements), REGISTRY) == []
+
+
+def test_no_policy_lets_no_one_outside_the_account_pull():
+    assert selection.repository_policy_gaps(None, REGISTRY) == []
+
+
+def test_a_statement_alone_rather_than_a_list_is_read():
+    document = json.dumps(
+        {"Statement": pull_statement({"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:root"})}
+    )
+    assert selection.repository_policy_gaps(document, REGISTRY) == [
+        f"repository policy allows account {OTHER_ACCOUNT}"
+    ]
+
+
+@pytest.mark.parametrize(
+    "statement, gap",
+    [
+        (
+            pull_statement({"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:root"}),
+            f"repository policy allows account {OTHER_ACCOUNT}",
+        ),
+        (
+            pull_statement({"AWS": [REGISTRY, OTHER_ACCOUNT]}),
+            f"repository policy allows account {OTHER_ACCOUNT}",
+        ),
+        (
+            pull_statement({"AWS": f"arn:aws:iam::{OTHER_ACCOUNT}:role/ci"}),
+            f"repository policy allows account {OTHER_ACCOUNT}",
+        ),
+        (pull_statement("*"), "repository policy allows *"),
+        (pull_statement({"AWS": "*"}), "repository policy allows *"),
+        (
+            pull_statement(
+                {"AWS": f"arn:aws:iam::{REGISTRY}:root"},
+                Condition={
+                    "ForAnyValue:StringLike": {"aws:PrincipalOrgPaths": "o-a/*"}
+                },
+            ),
+            "repository policy allows an organization (aws:PrincipalOrgPaths in statement 'Pull')",
+        ),
+        (
+            {
+                "Sid": "AllButMe",
+                "Effect": "Allow",
+                "NotPrincipal": {"AWS": f"arn:aws:iam::{REGISTRY}:root"},
+                "Action": "ecr:BatchGetImage",
+            },
+            "repository policy allows everyone but a NotPrincipal (statement 'AllButMe')",
+        ),
+        (
+            pull_statement({"AWS": "AROAEXAMPLEUNIQUEID"}),
+            "repository policy allows a principal the job can't place in an account: AROAEXAMPLEUNIQUEID",
+        ),
+        (
+            pull_statement({"Service": "codebuild.amazonaws.com"}),
+            "repository policy allows service codebuild.amazonaws.com",
+        ),
+        (
+            pull_statement({"Federated": "cognito-identity.amazonaws.com"}),
+            "repository policy allows Federated principal cognito-identity.amazonaws.com",
+        ),
+        (
+            pull_statement({"Service": "lambda.amazonaws.com"}),
+            "repository policy allows lambda.amazonaws.com for functions it doesn't prove are this account's "
+            "(statement 'Pull')",
+        ),
+    ],
+    ids=[
+        "another-account",
+        "another-account-among-this-one",
+        "a-role-in-another-account",
+        "star",
+        "aws-star",
+        "organization",
+        "not-principal",
+        "unique-id",
+        "another-service",
+        "federated",
+        "lambda-without-a-condition",
+    ],
+)
+def test_policies_that_let_someone_outside_the_account_pull(statement, gap):
+    assert gap in selection.repository_policy_gaps(policy(statement), REGISTRY)
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        {"StringLike": {"aws:sourceArn": f"arn:aws:lambda:{REGION}:*:function:*"}},
+        {
+            "StringLike": {
+                "aws:sourceArn": f"arn:aws:lambda:{REGION}:{OTHER_ACCOUNT}:function:*"
+            }
+        },
+        {
+            "StringLike": {
+                "aws:sourceArn": [
+                    f"arn:aws:lambda:{REGION}:{REGISTRY}:function:*",
+                    f"arn:aws:lambda:{REGION}:{OTHER_ACCOUNT}:function:*",
+                ]
+            }
+        },
+        {"StringLike": {"aws:sourceArn": f"arn:aws:lambda:*:{REGISTRY}*"}},
+        {
+            "StringLikeIfExists": {
+                "aws:sourceArn": f"arn:aws:lambda:{REGION}:{REGISTRY}:function:*"
+            }
+        },
+        {
+            "StringNotLike": {
+                "aws:sourceArn": f"arn:aws:lambda:{REGION}:{OTHER_ACCOUNT}:function:*"
+            }
+        },
+        {"StringLike": {"aws:SourceAccount": "1111*"}},
+        {"ArnLike": {"aws:SourceAccount": REGISTRY}},
+    ],
+    ids=[
+        "any-account",
+        "another-account",
+        "this-and-another-account",
+        "wildcard-in-the-account",
+        "if-exists",
+        "negated",
+        "wildcard-source-account",
+        "source-account-as-an-arn",
+    ],
+)
+def test_lambda_for_functions_the_job_cant_place_here(condition):
+    statement = dict(LAMBDA_STATEMENT, Condition=condition)
+    gaps = selection.repository_policy_gaps(policy(statement), REGISTRY)
+    assert gaps == [
+        "repository policy allows lambda.amazonaws.com for functions it doesn't prove are this account's "
+        "(statement 'LambdaECRImageRetrievalPolicy')"
+    ]
+
+
+@pytest.mark.parametrize(
+    "actions",
+    [
+        {"Action": "ecr:*"},
+        {"Action": "*"},
+        {"Action": "ECR:BatchGet*"},
+        {"Action": "ecr:GetDownloadUrlFor?ayer"},
+        {"Action": ["ecr:DescribeImages", "ecr:GetDownloadUrlForLayer"]},
+        {"NotAction": "ecr:BatchGetImage"},
+        {"NotAction": "s3:*"},
+    ],
+    ids=[
+        "ecr-wildcard",
+        "star",
+        "prefix-any-case",
+        "question-mark",
+        "one-of-the-two",
+        "not-action-of-one",
+        "not-action-of-another-service",
+    ],
+)
+def test_an_action_that_lets_pull(actions):
+    statement = dict(
+        {"Effect": "Allow", "Principal": {"AWS": OTHER_ACCOUNT}}, **actions
+    )
+    assert selection.repository_policy_gaps(policy(statement), REGISTRY) == [
+        f"repository policy allows account {OTHER_ACCOUNT}"
+    ]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "Allow",
+        dict(pull_statement({"AWS": OTHER_ACCOUNT}), Action=7),
+        dict(pull_statement({"AWS": [OTHER_ACCOUNT, 7]})),
+        dict(pull_statement(["*"])),
+        dict(pull_statement({"AWS": REGISTRY}), Condition=["aws:SourceAccount"]),
+    ],
+    ids=["not-an-object", "action", "principal-values", "principal", "condition"],
+)
+def test_a_statement_the_job_cant_read_makes_the_view_incomplete(statement):
+    gaps = selection.repository_policy_gaps(policy(statement), REGISTRY)
+    assert len(gaps) == 1
+    assert gaps[0].startswith("repository policy has a statement the job can't read")
+
+
+@pytest.mark.parametrize("text", ["not json", "[]"])
+def test_a_policy_that_isnt_a_json_object_fails_the_run(text):
+    with pytest.raises(selection.RepositoryError):
+        selection.repository_policy_gaps(text, REGISTRY)
+
+
+# --- Fail closed: ECS, Lambda and the repository's policy ---
+
+
+# Each read: the client that makes it, and for a paginated read, the key of its items, and the keys that carry the
+# next page's token out of one call and into the next.
+VIEW_READS = {
+    "get_repository_policy": ("ecr", None),
+    "list_clusters": ("ecs", ("clusterArns", "nextToken", "nextToken")),
+    "list_tasks": ("ecs", ("taskArns", "nextToken", "nextToken")),
+    "describe_tasks": ("ecs", None),
+    "list_services": ("ecs", ("serviceArns", "nextToken", "nextToken")),
+    "describe_services": ("ecs", None),
+    "describe_task_definition": ("ecs", None),
+    "list_functions": ("lambda_", ("Functions", "NextMarker", "Marker")),
+    "get_function": ("lambda_", None),
+}
+
+
+def a_repository_ecs_and_lambda_run() -> Tuple[Repo, Dict[str, str]]:
+    """A candidate nothing runs, in a repository whose ECS cluster and Lambda function each run another image."""
+    repo = Repo()
+    made = pulled_long_ago(repo, "old", tags=["abc"], pushed=40)
+    running = pulled_long_ago(repo, "running", tags=["def"])
+    repo.task(None, running["index"])
+    repo.service("web", [("PRIMARY", repo.task_definition("web:1", uri("def")))])
+    repo.function("fn", "1", resolved=uri(image_digest=running["platform"]))
+    return repo, made
+
+
+class _StopStubbing(Exception):
+    """The failed read is stubbed: the run makes no call after it."""
+
+
+class FailingStub:
+    """
+    A Stubber that passes every answer through but one operation's, which it fails: on its first page, or on its
+    second, after a first page with no items.
+    """
+
+    def __init__(self, stub: Stubber, operation: str, page: int, code: str) -> None:
+        self.stub = stub
+        self.operation = operation
+        self.page = page
+        self.code = code
+
+    def add_response(
+        self,
+        name: str,
+        response: Dict[str, Any],
+        expected: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if name != self.operation:
+            self.stub.add_response(name, response, expected)
+            return
+        self.add_client_error(name, expected_params=expected, response=response)
+
+    def add_client_error(self, name: str, **kwargs: Any) -> None:
+        if name != self.operation:
+            self.stub.add_client_error(name, **kwargs)
+            return
+        expected = kwargs.get("expected_params")
+        if self.page == 2:
+            items_key, token_out, token_in = VIEW_READS[name][1]
+            first = dict(
+                kwargs.get("response") or {}, **{items_key: [], token_out: "page-2"}
+            )
+            self.stub.add_response(name, first, expected)
+            expected = dict(expected or {}, **{token_in: "page-2"})
+        self.stub.add_client_error(
+            name,
+            service_error_code=self.code,
+            http_status_code=400,
+            expected_params=expected,
+        )
+        raise _StopStubbing()
+
+
+def fail_on(repo: Repo, stubs: Stubs, operation: str, page: int, code: str) -> None:
+    """Answer the run's reads in order, up to ``operation``, which fails."""
+    client = VIEW_READS[operation][0]
+    failing = {
+        name: (
+            FailingStub(getattr(stubs, name), operation, page, code)
+            if name == client
+            else getattr(stubs, name)
+        )
+        for name in ("ecr", "ecs", "lambda_")
+    }
+    with contextlib.suppress(_StopStubbing):
+        repo.stub_ecr_reads(stubs.ecr)
+        stubs.inspector.add_response("list_findings", {"findings": repo.findings})
+        stubs.inspector.add_response(
+            "list_coverage", {"coveredResources": repo.coverage}
+        )
+        repo.stub_policy(failing["ecr"])
+        repo.stub_tasks(failing["ecs"], repo.tasks, services=True)
+        repo.stub_task_definitions(failing["ecs"])
+        repo.stub_functions(failing["lambda_"])
+
+
+@pytest.mark.parametrize("code", ["ThrottlingException", "AccessDeniedException"])
+@pytest.mark.parametrize(
+    "operation, page",
+    [
+        (operation, page)
+        for operation, (_, paginated) in VIEW_READS.items()
+        for page in ((1, 2) if paginated else (1,))
+    ],
+)
+def test_a_failed_read_of_the_view_deletes_nothing(operation, page, code):
+    # No delete is stubbed, so a delete would fail the test with another error than the ClientError.
+    repo, _ = a_repository_ecs_and_lambda_run()
+    if operation == "get_repository_policy":
+        repo.allow(LAMBDA_STATEMENT)
+    with Stubs() as stubs:
+        fail_on(repo, stubs, operation, page, code)
+        with pytest.raises(ClientError, match=code):
+            cleanup.run(settings(), stubs.clients, NOW)
+        stubs.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize("operation", ["describe_tasks", "describe_services"])
+@pytest.mark.parametrize("answer", ["failure", "left-out"])
+def test_ecs_not_describing_what_it_listed_fails_the_run(operation, answer):
+    repo, _ = a_repository_ecs_and_lambda_run()
+    key, arn_key = (
+        ("tasks", "taskArn")
+        if operation == "describe_tasks"
+        else ("services", "serviceArn")
+    )
+    with Stubs() as stubs:
+
+        class Answering:
+            def __init__(self, stub: Stubber) -> None:
+                self.stub = stub
+
+            def add_response(self, name, response, expected=None):
+                if name == operation:
+                    arn = response[key][0][arn_key]
+                    response = dict(response, **{key: []})
+                    if answer == "failure":
+                        response["failures"] = [{"arn": arn, "reason": "MISSING"}]
+                    self.stub.add_response(name, response, expected)
+                    raise _StopStubbing()
+                return self.stub.add_response(name, response, expected)
+
+        repo.stub_ecr_reads(stubs.ecr)
+        stubs.inspector.add_response("list_findings", {"findings": repo.findings})
+        stubs.inspector.add_response(
+            "list_coverage", {"coveredResources": repo.coverage}
+        )
+        repo.stub_policy(stubs.ecr)
+        with contextlib.suppress(_StopStubbing):
+            repo.stub_tasks(Answering(stubs.ecs), repo.tasks, services=True)
+        with pytest.raises(cleanup.CleanupError, match="ECS didn't describe"):
+            cleanup.run(settings(), stubs.clients, NOW)
+
+
+def test_a_failed_read_of_the_running_tasks_before_deleting_deletes_nothing():
+    repo, made = a_repository_ecs_and_lambda_run()
+    with Stubs() as stubs:
+        repo.stub_reads(stubs)
+        repo.stub_recheck(stubs.ecr, [made["platform"]])
+        stubs.ecs.add_response(
+            "list_clusters",
+            {"clusterArns": [repo.cluster()], "nextToken": "page-2"},
+            {},
+        )
+        stubs.ecs.add_client_error(
+            "list_clusters",
+            service_error_code="ThrottlingException",
+            http_status_code=400,
+        )
+        with pytest.raises(ClientError, match="ThrottlingException"):
+            cleanup.run(settings(), stubs.clients, NOW)
+
+
+def test_the_reads_of_the_view_ask_for_what_they_must():
+    # Running tasks only, and every function version: the Stubber checks each call's parameters.
+    repo, made = a_repository_ecs_and_lambda_run()
+    summary = repo.run(deletions=deletes(made), recheck=[made["platform"]])
+    assert summary["deleted"] == 1
+    assert summary["images_in_use_by"]["ecs"] == 1
+    assert summary["images_in_use_by"]["lambda"] == 1
+
+
+# --- Reading the running tasks again before deleting ---
+
+
+def test_a_task_that_starts_before_the_delete_keeps_its_image(caplog):
+    repo = Repo()
+    made = pulled_long_ago(repo, "rollback", tags=["abc"])
+    repo.cluster()
+    repo.task(None, made["index"], service="api", on_recheck=True)
+    with caplog.at_level("INFO"):
+        summary = repo.run(recheck=[made["platform"]])
+    assert summary["deleted"] == 0
+    assert summary["candidates"] == 0
+    assert summary["dropped_on_recheck"] == 1
+    (recheck,) = [line for line in logged(caplog) if line.get("action") == "recheck"]
+    assert recheck["dropped"] == [made["index"]]
+    line = kept_line(caplog)
+    assert line["use_judged_by"] == "ecs"
+    assert line["in_use_by"][0]["via"] == "running_task"
+
+
+def test_a_task_that_stops_before_the_delete_still_keeps_its_image():
+    # A use one read shows counts, though a later one misses it.
+    repo = Repo()
+    made = pulled_long_ago(repo, "stopping", tags=["abc"])
+    repo.task(None, made["index"])
+    repo.tasks_on_recheck = {repo.cluster(): []}
+    summary = repo.run()
+    assert summary["deleted"] == 0
+    assert summary["protected"]["in_use"] == 1
+
+
+def test_a_task_that_starts_frees_its_place_under_the_cap_for_the_next():
+    repo = Repo()
+    older = pulled_long_ago(repo, "older", tags=["a"], pushed=40)
+    newer = pulled_long_ago(repo, "newer", tags=["b"], pushed=30)
+    repo.cluster()
+    repo.task(None, older["platform"], on_recheck=True)
+    summary = repo.run(
+        deletions=deletes(newer),
+        recheck=[older["platform"], newer["platform"]],
+        max_deletions=1,
+    )
+    assert summary["deleted"] == 1
+    assert summary["left_by_cap"] == 0
+    assert summary["dropped_on_recheck"] == 1
+
+
+def test_the_reads_again_cover_every_candidates_pull_record():
+    # Judged by Inspector, never pulled, pulled before the soak: each candidate's runnable manifests, oldest first.
+    repo = Repo()
+    by_inspector = vulnerable_index(repo, "inspector", tags=["a"], pushed=50)
+    never = never_pulled_index(repo, "never", tags=["b"], pushed=40)
+    old = pulled_long_ago(repo, "old", tags=["c"], pushed=30)
+    summary = repo.run(
+        deletions=deletes(by_inspector) + deletes(never) + deletes(old),
+        recheck=[by_inspector["platform"], never["platform"], old["platform"]],
+    )
+    assert summary["deleted"] == 3
+
+
+def test_a_lambda_version_runs_the_digest_it_resolved_not_its_tags_image_now():
+    # The tag v2 has moved on since the version was deployed: Lambda still runs the digest it resolved then.
+    repo = Repo()
+    old = pulled_long_ago(repo, "old", tags=["v1"], pushed=40)
+    moved = pulled_long_ago(repo, "moved", tags=["v2"])
+    repo.function(
+        "fn", "1", resolved=uri(image_digest=old["index"]), image_uri=uri("v2")
+    )
+    summary = repo.run(deletions=deletes(moved), recheck=[moved["platform"]])
+    assert summary["deleted"] == 1
+    assert summary["protected"]["in_use"] == 1
+
+
+def test_a_lambda_version_without_a_resolved_digest_keeps_what_its_uri_names():
+    repo = Repo()
+    pulled_long_ago(repo, "old", tags=["v1"])
+    repo.function("fn", "1", image_uri=uri("v1"))
+    assert repo.run()["protected"]["in_use"] == 1
