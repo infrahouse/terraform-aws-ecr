@@ -35,9 +35,10 @@ policy from a few inputs, in an order that protects what runs:
 - **Vulnerable image cleanup.** Amazon Inspector reports
   vulnerabilities in every image it monitors, used or not. An opt-in
   daily Lambda deletes the vulnerable images that nothing protects. It
-  keeps what the lifecycle policy keeps, what runs or ran recently,
-  what was pushed recently, and anything whose use it can't judge. It
-  runs dry until you turn deletion on, and fails closed.
+  keeps the retained images and the rollback candidates the lifecycle
+  policy keeps, what runs or ran recently, what was pushed recently,
+  and anything whose use it can't judge. It runs dry until you turn
+  deletion on, and fails closed.
 
 The module creates the repository and its lifecycle policy, and the
 cleanup when it is on. It sets no repository policy, replication,
@@ -54,22 +55,6 @@ scanning or encryption options.
 - Vulnerable image cleanup: an opt-in scheduled job that deletes the
   images Amazon Inspector reports vulnerable and that nothing protects
 - Rollback candidates, retained tags and the cleanup are opt-in
-
-## Requirements
-
-- Terraform 1.9 or later
-- AWS provider 6.0 or later, below 7.0
-- The `null` and `time` providers
-
-The vulnerable image cleanup runs as
-[terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored),
-which needs this floor: its S3 bucket comes from
-[terraform-aws-s3-bucket](https://github.com/infrahouse/terraform-aws-s3-bucket),
-which needs AWS provider 6.0. Terraform installs a module's providers
-whether the module is used or not, so the floor applies to every caller,
-with the cleanup on or off: a caller on AWS provider 5 upgrades to 6
-before taking this release. Earlier releases of this module needed
-Terraform 1.5 and AWS provider 5.11.
 
 ## Quick Start
 
@@ -313,7 +298,7 @@ An image is protected, and kept, when any of these hold:
   image, within the soak (`lastRecordedPullTime`).
 - It was pushed within `vulnerable_image_cleanup_min_age_days` (default
   7), so an image waiting for its pin isn't deleted.
-- It isn't ACTIVE: an archived image.
+- It isn't ACTIVE: it is archived, or being restored.
 - The job can't tell whether it is in use. That is a platform image, or
   a single-manifest image, that Inspector gives no in-use data on and
   that ECR recorded a pull of before the soak: a long-running task that
@@ -439,6 +424,22 @@ The full documentation is on [GitHub Pages](https://infrahouse.github.io/terrafo
 - [Troubleshooting](https://infrahouse.github.io/terraform-aws-ecr/troubleshooting/): errors at plan and apply, and
   what the cleanup's logs say
 - [Changelog](https://infrahouse.github.io/terraform-aws-ecr/changelog/)
+
+## Terraform and Provider Versions
+
+- Terraform 1.9 or later, below 2.0
+- AWS provider 6.0 or later, below 7.0
+- The `null` and `time` providers
+
+The vulnerable image cleanup runs as
+[terraform-aws-lambda-monitored](https://github.com/infrahouse/terraform-aws-lambda-monitored),
+which needs this floor: its S3 bucket comes from
+[terraform-aws-s3-bucket](https://github.com/infrahouse/terraform-aws-s3-bucket),
+which needs AWS provider 6.0. Terraform installs a module's providers
+whether the module is used or not, so the floor applies to every caller,
+with the cleanup on or off: a caller on AWS provider 5 upgrades to 6
+before taking this release. Earlier releases of this module needed
+Terraform 1.5 and AWS provider 5.11.
 
 <!-- BEGIN_TF_DOCS -->
 
