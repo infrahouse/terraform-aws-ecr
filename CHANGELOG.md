@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1] - 2026-11-24
+
+### Bug Fixes
+
+- Judge an image ECR never recorded a pull of as not in use
+- Read images judged never pulled again before deleting them
+
+### Documentation
+
+- The cleanup judges use from ECR's pull record too
+- State the never-pulled rule's conditions, the pull time's date, and the job's reads
+- The reads again before deleting, ECR's flapping answers, and attestation pulls
+
+### Testing
+
+- Judge use from Inspector's real coverage and ECR's real pull record
+- An ECR model without lastRecordedPullTime fails the run before any call
+- Wait for ECR's answers to agree on a pull before counting on it
+
 ## [1.0.0] - 2026-11-23
 
 ### Bug Fixes
