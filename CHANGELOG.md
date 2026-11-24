@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-11-24
+
+### Documentation
+
+- README's Why This Module and Examples, and fix what disagreed with ECR
+- Add the basic, rollback-and-retained-tags and vulnerable-image-cleanup examples
+- GitHub Pages: getting started, architecture, configuration, examples, troubleshooting
+- Quote lambda-monitored's errors for a missing build tool
+- README's version floor after Documentation, and what the cleanup keeps
+- Review fixes: what the cleanup keeps, the soak, S3, the alarm label
+
+### Testing
+
+- Validate the examples, and check every version pin follows the release
+
 ## [1.0.1] - 2026-11-24
 
 ### Bug Fixes
